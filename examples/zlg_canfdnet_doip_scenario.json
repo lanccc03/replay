@@ -1,0 +1,111 @@
+{
+  "scenario_id": "zlg-canfdnet-doip-template",
+  "name": "ZLG CANFDNET + DoIP Template",
+  "trace_file_ids": [],
+  "bindings": [
+    {
+      "adapter_id": "zlg-main",
+      "driver": "zlg",
+      "logical_channel": 0,
+      "physical_channel": 0,
+      "bus_type": "CANFD",
+      "device_type": "CANFDNET_200U_TCP",
+      "device_index": 0,
+      "sdk_root": "zlgcan_python_251211",
+      "nominal_baud": 500000,
+      "data_baud": 2000000,
+      "resistance_enabled": true,
+      "listen_only": false,
+      "tx_echo": true,
+      "merge_receive": true,
+      "network": {
+        "work_mode": 0,
+        "ip": "192.168.0.178",
+        "work_port": 8000,
+        "local_port": 4001
+      },
+      "metadata": {}
+    }
+  ],
+  "database_bindings": [
+    {
+      "logical_channel": 0,
+      "path": "C:/dbc/vehicle.dbc",
+      "format": "dbc"
+    }
+  ],
+  "signal_overrides": [
+    {
+      "logical_channel": 0,
+      "message_id_or_pgn": 291,
+      "signal_name": "VehicleSpeed",
+      "value": 0
+    }
+  ],
+  "diagnostic_targets": [
+    {
+      "name": "can-ecu",
+      "transport": "CAN",
+      "adapter_id": "zlg-main",
+      "logical_channel": 0,
+      "tx_id": 2016,
+      "rx_id": 2024,
+      "host": "",
+      "port": 13400,
+      "source_address": 3584,
+      "target_address": 1,
+      "activation_type": 0,
+      "timeout_ms": 1000,
+      "metadata": {}
+    },
+    {
+      "name": "doip-ecu",
+      "transport": "DOIP",
+      "adapter_id": "",
+      "logical_channel": 0,
+      "tx_id": 2016,
+      "rx_id": 2024,
+      "host": "192.168.0.10",
+      "port": 13400,
+      "source_address": 3584,
+      "target_address": 1,
+      "activation_type": 0,
+      "timeout_ms": 1000,
+      "metadata": {}
+    }
+  ],
+  "diagnostic_actions": [
+    {
+      "ts_ns": 500000000,
+      "target": "doip-ecu",
+      "service_id": 34,
+      "payload": "f190",
+      "transport": "DOIP",
+      "timeout_ms": 1000,
+      "description": "ReadDataByIdentifier VIN",
+      "metadata": {}
+    }
+  ],
+  "link_actions": [
+    {
+      "ts_ns": 2000000000,
+      "adapter_id": "zlg-main",
+      "action": "DISCONNECT",
+      "logical_channel": 0,
+      "description": "Inject channel disconnect",
+      "metadata": {}
+    },
+    {
+      "ts_ns": 3000000000,
+      "adapter_id": "zlg-main",
+      "action": "RECONNECT",
+      "logical_channel": 0,
+      "description": "Recover channel",
+      "metadata": {}
+    }
+  ],
+  "metadata": {
+    "note": "Adjust hardware type, ports, IP, and DBC path before using on Windows."
+  }
+}
+

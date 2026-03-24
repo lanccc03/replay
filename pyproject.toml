@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "replay-platform"
+version = "0.1.0"
+description = "Windows multi-bus replay and diagnostics desktop platform for ZLG-based CAN/CANFD/J1939/DoIP workflows."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+dependencies = [
+  "PySide6>=6.7; platform_system == 'Windows'",
+  "python-can>=4.4",
+  "cantools>=39.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+replay-platform = "replay_platform.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

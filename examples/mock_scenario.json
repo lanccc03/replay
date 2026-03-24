@@ -1,0 +1,34 @@
+{
+  "scenario_id": "mock-demo",
+  "name": "Mock Replay Demo",
+  "trace_file_ids": [],
+  "bindings": [
+    {
+      "adapter_id": "mock-1",
+      "driver": "mock",
+      "logical_channel": 0,
+      "physical_channel": 0,
+      "bus_type": "CAN",
+      "device_type": "MOCK",
+      "device_index": 0,
+      "sdk_root": "zlgcan_python_251211",
+      "nominal_baud": 500000,
+      "data_baud": 2000000,
+      "resistance_enabled": true,
+      "listen_only": false,
+      "tx_echo": false,
+      "merge_receive": false,
+      "network": {},
+      "metadata": {}
+    }
+  ],
+  "database_bindings": [],
+  "signal_overrides": [],
+  "diagnostic_targets": [],
+  "diagnostic_actions": [],
+  "link_actions": [],
+  "metadata": {
+    "note": "Use this template to verify UI, storage, and runtime without hardware."
+  }
+}
+
