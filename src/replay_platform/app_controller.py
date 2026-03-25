@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from replay_platform.adapters.base import DiagnosticClient, DeviceAdapter
 from replay_platform.adapters.mock import MockDeviceAdapter
@@ -18,6 +19,9 @@ from replay_platform.services.signal_catalog import SignalOverrideService
 from replay_platform.services.trace_loader import TraceLoader
 
 
+LOG_BUFFER_LIMIT = 2000
+
+
 class ReplayApplication:
     def __init__(self, workspace: Path) -> None:
         self.paths = AppPaths(root=workspace)
@@ -25,10 +29,30 @@ class ReplayApplication:
         self.library = FileLibraryService(self.paths, self.trace_loader)
         self.signal_overrides = SignalOverrideService()
         self.engine = ReplayEngine(signal_overrides=self.signal_overrides, logger=self.log)
-        self.logs: List[str] = []
+        self._logs: List[str] = []
+        self._log_base_index = 0
+        self._log_lock = threading.Lock()
 
     def log(self, message: str) -> None:
-        self.logs.append(message)
+        with self._log_lock:
+            self._logs.append(message)
+            overflow = len(self._logs) - LOG_BUFFER_LIMIT
+            if overflow > 0:
+                del self._logs[:overflow]
+                self._log_base_index += overflow
+
+    @property
+    def log_limit(self) -> int:
+        return LOG_BUFFER_LIMIT
+
+    @property
+    def logs(self) -> List[str]:
+        _, entries = self.log_snapshot()
+        return entries
+
+    def log_snapshot(self) -> tuple[int, List[str]]:
+        with self._log_lock:
+            return self._log_base_index, list(self._logs)
 
     def new_scenario(self, name: str) -> ScenarioSpec:
         return ScenarioSpec(scenario_id=uuid.uuid4().hex, name=name)

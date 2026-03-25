@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import threading
 import time
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from replay_platform.adapters.base import DeviceAdapter, DiagnosticClient
 from replay_platform.core import (
+    BusType,
+    ChannelConfig,
+    ChannelDescriptor,
     DeviceChannelBinding,
     DiagnosticAction,
     FrameEvent,
@@ -17,8 +21,20 @@ from replay_platform.core import (
     TimelineItem,
     UdsRequest,
 )
-from replay_platform.errors import AdapterOperationError, ConfigurationError
+from replay_platform.errors import ConfigurationError
 from replay_platform.services.signal_catalog import SignalOverrideService
+
+
+FRAME_SLICE_WINDOW_NS = 2_000_000
+FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
+
+
+@dataclass(frozen=True)
+class PreparedFrame:
+    adapter_id: str
+    logical_channel: int
+    physical_channel: int
+    frame: FrameEvent
 
 
 class ReplayEngine:
@@ -110,15 +126,64 @@ class ReplayEngine:
 
     def _prepare_channels(self) -> None:
         assert self._scenario is not None
-        seen = set()
+        bindings_by_adapter: Dict[str, List[DeviceChannelBinding]] = {}
         for binding in self._scenario.bindings:
-            adapter = self._adapters.get(binding.adapter_id)
+            bindings_by_adapter.setdefault(binding.adapter_id, []).append(binding)
+        for adapter_id, bindings in bindings_by_adapter.items():
+            adapter = self._adapters.get(adapter_id)
             if adapter is None:
-                raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
-            if binding.adapter_id not in seen:
-                adapter.open()
-                seen.add(binding.adapter_id)
-            adapter.start_channel(binding.physical_channel, binding.channel_config())
+                raise ConfigurationError(f"适配器 {adapter_id} 未配置。")
+            adapter.open()
+            for physical_channel, config in self._channel_start_plan(bindings, adapter.enumerate_channels()).items():
+                adapter.start_channel(physical_channel, config)
+
+    def _channel_start_plan(
+        self,
+        bindings: Sequence[DeviceChannelBinding],
+        descriptors: Sequence[ChannelDescriptor],
+    ) -> Dict[int, ChannelConfig]:
+        if not bindings:
+            return {}
+        binding_configs = {
+            binding.physical_channel: binding.channel_config()
+            for binding in bindings
+        }
+        descriptor_bus_types = {
+            descriptor.physical_channel: descriptor.bus_type
+            for descriptor in descriptors
+        }
+        fallback_binding = bindings[0]
+        physical_channels = set(binding_configs)
+        physical_channels.update(descriptor_bus_types)
+        start_plan: Dict[int, ChannelConfig] = {}
+        for physical_channel in sorted(physical_channels):
+            config = binding_configs.get(physical_channel)
+            if config is not None:
+                start_plan[physical_channel] = config
+                continue
+            start_plan[physical_channel] = self._fallback_channel_config(
+                fallback_binding,
+                descriptor_bus_types.get(physical_channel),
+            )
+        return start_plan
+
+    @staticmethod
+    def _fallback_channel_config(
+        binding: DeviceChannelBinding,
+        bus_type: Optional[BusType],
+    ) -> ChannelConfig:
+        config = binding.channel_config()
+        if bus_type is None or bus_type == config.bus_type:
+            return config
+        return ChannelConfig(
+            bus_type=bus_type,
+            nominal_baud=config.nominal_baud,
+            data_baud=config.data_baud,
+            resistance_enabled=config.resistance_enabled,
+            listen_only=config.listen_only,
+            tx_echo=config.tx_echo,
+            extra=dict(config.extra),
+        )
 
     def _run_loop(self) -> None:
         while True:
@@ -133,19 +198,24 @@ class ReplayEngine:
                 self._teardown_adapters()
                 self.logger("回放已完成。")
                 return
-            item = self._timeline[self._timeline_index]
+            frame_batch = self._frame_batch_at(self._timeline_index)
+            item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
+            advance_count = len(frame_batch) if frame_batch else 1
             target_ns = self._base_perf_ns + item.ts_ns
             now_ns = time.perf_counter_ns()
             if now_ns < target_ns:
                 self._sleep_until(target_ns)
                 continue
             try:
-                self._dispatch(item)
+                if frame_batch:
+                    self._dispatch_frame_batch(frame_batch)
+                else:
+                    self._dispatch(item)
             except Exception as exc:  # pragma: no cover - defensive runtime logging
                 self.stats.errors.append(str(exc))
                 self.logger(f"回放异常：{exc}")
             finally:
-                self._timeline_index += 1
+                self._timeline_index += advance_count
 
     def _sleep_until(self, target_ns: int) -> None:
         while True:
@@ -160,7 +230,7 @@ class ReplayEngine:
 
     def _dispatch(self, item: TimelineItem) -> None:
         if isinstance(item, FrameEvent):
-            self._dispatch_frame(item)
+            self._dispatch_frame_batch([item])
             return
         if isinstance(item, DiagnosticAction):
             self._dispatch_diagnostic(item)
@@ -170,18 +240,55 @@ class ReplayEngine:
             return
         raise ConfigurationError(f"不支持的时间轴项目：{item!r}")
 
-    def _dispatch_frame(self, frame: FrameEvent) -> None:
-        binding = self._binding_for(frame.channel)
-        if binding is None:
-            raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
-        adapter = self._adapters[binding.adapter_id]
-        mapped = self.signal_overrides.apply(frame)
-        mapped = mapped.clone(channel=binding.physical_channel)
-        sent = adapter.send([mapped])
-        if sent == 1:
-            self.stats.sent_frames += 1
-        else:
-            self.stats.skipped_frames += 1
+    def _frame_batch_at(self, start_index: int) -> List[FrameEvent]:
+        if start_index >= len(self._timeline):
+            return []
+        first_item = self._timeline[start_index]
+        if not isinstance(first_item, FrameEvent):
+            return []
+        batch = [first_item]
+        window_end_ns = first_item.ts_ns + FRAME_SLICE_WINDOW_NS
+        next_index = start_index + 1
+        while next_index < len(self._timeline):
+            item = self._timeline[next_index]
+            if not isinstance(item, FrameEvent):
+                break
+            if item.ts_ns >= window_end_ns:
+                break
+            batch.append(item)
+            next_index += 1
+        return batch
+
+    def _dispatch_frame_batch(self, frames: Sequence[FrameEvent]) -> None:
+        frames_by_adapter: Dict[str, List[PreparedFrame]] = {}
+        for frame in frames:
+            binding = self._binding_for(frame.channel)
+            if binding is None:
+                raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
+            mapped = self.signal_overrides.apply(frame)
+            mapped = mapped.clone(channel=binding.physical_channel)
+            frames_by_adapter.setdefault(binding.adapter_id, []).append(
+                PreparedFrame(
+                    adapter_id=binding.adapter_id,
+                    logical_channel=frame.channel,
+                    physical_channel=binding.physical_channel,
+                    frame=mapped,
+                )
+            )
+        for adapter_id, adapter_frames in frames_by_adapter.items():
+            adapter = self._adapters.get(adapter_id)
+            if adapter is None:
+                raise ConfigurationError(f"适配器 {adapter_id} 未配置。")
+            sent = int(adapter.send([item.frame for item in adapter_frames]) or 0)
+            sent_count = max(0, min(sent, len(adapter_frames)))
+            self.stats.sent_frames += sent_count
+            self.stats.skipped_frames += len(adapter_frames) - sent_count
+            for item in adapter_frames[:sent_count]:
+                self._log_sent_frame(item)
+            if sent_count < len(adapter_frames):
+                self.logger(
+                    f"回放帧发送未完成：适配器={adapter_id} 已发 {sent_count}/{len(adapter_frames)}"
+                )
 
     def _dispatch_diagnostic(self, action: DiagnosticAction) -> None:
         client = self._diagnostics.get(action.target)
@@ -220,6 +327,23 @@ class ReplayEngine:
     def _binding_for(self, logical_channel: int) -> Optional[DeviceChannelBinding]:
         assert self._scenario is not None
         return self._scenario.find_binding(logical_channel)
+
+    def _log_sent_frame(self, item: PreparedFrame) -> None:
+        if item.frame.bus_type not in FRAME_LOG_BUS_TYPES:
+            return
+        self.logger(
+            "回放帧 [{bus}] t={ts_ms:.3f}ms 适配器={adapter} 逻辑通道={logical} "
+            "物理通道={physical} ID=0x{id:X} DLC={dlc} DATA={data}".format(
+                bus=item.frame.bus_type.value,
+                ts_ms=item.frame.ts_ns / 1_000_000,
+                adapter=item.adapter_id,
+                logical=item.logical_channel,
+                physical=item.physical_channel,
+                id=item.frame.message_id,
+                dlc=item.frame.dlc,
+                data=item.frame.payload.hex().upper(),
+            )
+        )
 
     def _teardown_adapters(self) -> None:
         for adapter in self._adapters.values():
