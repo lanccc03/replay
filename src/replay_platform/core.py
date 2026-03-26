@@ -19,6 +19,23 @@ class ReplayState(str, Enum):
     PAUSED = "PAUSED"
 
 
+class ReplayLaunchSource(str, Enum):
+    SCENARIO_BOUND = "scenario_bound"
+    SELECTED_FALLBACK = "selected_fallback"
+
+
+class ReplayLogLevel(str, Enum):
+    WARNING = "warning"
+    INFO = "info"
+    DEBUG = "debug"
+
+
+class ReplayFrameLogMode(str, Enum):
+    OFF = "off"
+    SAMPLED = "sampled"
+    ALL = "all"
+
+
 class LinkActionType(str, Enum):
     DISCONNECT = "DISCONNECT"
     RECONNECT = "RECONNECT"
@@ -82,6 +99,20 @@ class ChannelConfig:
     listen_only: bool = False
     tx_echo: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReplayLogConfig:
+    level: ReplayLogLevel = ReplayLogLevel.INFO
+    frame_mode: ReplayFrameLogMode = ReplayFrameLogMode.OFF
+    frame_sample_rate: int = 100
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.level, ReplayLogLevel):
+            self.level = ReplayLogLevel(self.level)
+        if not isinstance(self.frame_mode, ReplayFrameLogMode):
+            self.frame_mode = ReplayFrameLogMode(self.frame_mode)
+        self.frame_sample_rate = max(int(self.frame_sample_rate), 1)
 
 
 @dataclass
@@ -204,6 +235,13 @@ class SignalOverride:
     value: Any
 
 
+@dataclass(frozen=True)
+class FrameEnableRule:
+    logical_channel: int
+    message_id: int
+    enabled: bool = True
+
+
 @dataclass
 class UdsRequest:
     service_id: int
@@ -235,6 +273,19 @@ class ReplayStats:
     diagnostic_actions: int = 0
     link_actions: int = 0
     errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReplayRuntimeSnapshot:
+    state: ReplayState = ReplayState.STOPPED
+    current_ts_ns: int = 0
+    total_ts_ns: int = 0
+    timeline_index: int = 0
+    timeline_size: int = 0
+    current_item_kind: Optional[TimelineKind] = None
+    current_source_file: str = ""
+    adapter_health: Dict[str, AdapterHealth] = field(default_factory=dict)
+    launch_source: Optional[ReplayLaunchSource] = None
 
 
 @dataclass
@@ -398,4 +449,3 @@ def dataclass_to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [dataclass_to_jsonable(item) for item in value]
     return value
-

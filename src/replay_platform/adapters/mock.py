@@ -27,6 +27,7 @@ class MockDeviceAdapter(DeviceAdapter):
         self._rx_queue: Deque[FrameEvent] = deque()
         self._started_channels: Dict[int, ChannelConfig] = {}
         self.sent_frames: List[FrameEvent] = []
+        self.scheduled_batches: List[List[FrameEvent]] = []
         self.reconnect_count = 0
         self.open_count = 0
 
@@ -58,6 +59,10 @@ class MockDeviceAdapter(DeviceAdapter):
         self.sent_frames.extend(batch)
         return len(batch)
 
+    def send_scheduled(self, batch: Sequence[FrameEvent], enqueue_base_ns: int) -> int:
+        self.scheduled_batches.append([item.clone() for item in batch])
+        return self.send(batch)
+
     def read(self, limit: int = 256, timeout_ms: int = 0) -> List[FrameEvent]:
         items: List[FrameEvent] = []
         while self._rx_queue and len(items) < limit:
@@ -88,4 +93,3 @@ class MockDeviceAdapter(DeviceAdapter):
             bus_usage=True,
             can_uds=True,
         )
-

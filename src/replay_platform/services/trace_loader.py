@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import json
-import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Optional, Sequence
 
 from replay_platform.core import BusType, FrameEvent
 from replay_platform.errors import DependencyUnavailableError, TraceFormatError
 
 
-ASC_LINE = re.compile(
-    r"^(?P<ts>\d+\.\d+)\s+"
-    r"(?P<channel>\d+)\s+"
-    r"(?P<msgid>[0-9A-Fa-f]+)(?P<ext>x|X)?\s+"
-    r"(?P<direction>Rx|Tx)\s+"
-    r"(?P<kind>[dD])\s+"
-    r"(?P<dlc>\d+)\s*"
-    r"(?P<data>(?:[0-9A-Fa-f]{2}\s*)*)$"
-)
+ASC_DIRECTIONS = frozenset({"rx", "tx"})
+BINARY_CACHE_FORMAT = "binary-v1"
+BINARY_CACHE_SUFFIX = ".rplbin"
+BINARY_CACHE_MAGIC = b"RPLBIN1\0"
+BINARY_CACHE_VERSION = 1
+_BINARY_FILE_HEADER = struct.Struct("<8sHI")
+_BINARY_RECORD_LENGTH = struct.Struct("<I")
+_BINARY_RECORD_HEADER = struct.Struct("<qBIIHIIII")
+_BUS_TYPE_TO_CODE = {
+    BusType.CAN: 1,
+    BusType.CANFD: 2,
+    BusType.J1939: 3,
+    BusType.ETH: 4,
+}
+_BUS_TYPE_FROM_CODE = {value: key for key, value in _BUS_TYPE_TO_CODE.items()}
 
 
 @dataclass
@@ -81,34 +87,284 @@ class TraceLoader:
             for item in payload
         ]
 
+    def write_binary_cache(self, path: Path, events: Sequence[FrameEvent]) -> None:
+        with path.open("wb") as handle:
+            handle.write(
+                _BINARY_FILE_HEADER.pack(
+                    BINARY_CACHE_MAGIC,
+                    BINARY_CACHE_VERSION,
+                    len(events),
+                )
+            )
+            for item in events:
+                payload = bytes(item.payload)
+                flags = (
+                    json.dumps(item.flags, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                    if item.flags
+                    else b""
+                )
+                source = item.source_file.encode("utf-8") if item.source_file else b""
+                metadata = (
+                    json.dumps(
+                        item.metadata,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    if item.metadata
+                    else b""
+                )
+                record = _BINARY_RECORD_HEADER.pack(
+                    int(item.ts_ns),
+                    _BUS_TYPE_TO_CODE[item.bus_type],
+                    int(item.channel),
+                    int(item.message_id) & 0xFFFFFFFF,
+                    int(item.dlc),
+                    len(payload),
+                    len(flags),
+                    len(source),
+                    len(metadata),
+                )
+                handle.write(_BINARY_RECORD_LENGTH.pack(len(record) + len(payload) + len(flags) + len(source) + len(metadata)))
+                handle.write(record)
+                handle.write(payload)
+                handle.write(flags)
+                handle.write(source)
+                handle.write(metadata)
+
+    def load_binary_cache(self, path: Path) -> List[FrameEvent]:
+        events: List[FrameEvent] = []
+        payload = path.read_bytes()
+        if len(payload) < _BINARY_FILE_HEADER.size:
+            raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
+        magic, version, record_count = _BINARY_FILE_HEADER.unpack(
+            payload[: _BINARY_FILE_HEADER.size]
+        )
+        if magic != BINARY_CACHE_MAGIC or version != BINARY_CACHE_VERSION:
+            raise TraceFormatError(f"不支持的二进制缓存格式：{path}")
+        offset = _BINARY_FILE_HEADER.size
+        view = memoryview(payload)
+        for _index in range(record_count):
+            if offset + _BINARY_RECORD_LENGTH.size > len(payload):
+                raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
+            record_length = _BINARY_RECORD_LENGTH.unpack_from(payload, offset)[0]
+            offset += _BINARY_RECORD_LENGTH.size
+            record_end = offset + record_length
+            if record_end > len(payload):
+                raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
+            record = view[offset:record_end]
+            (
+                ts_ns,
+                bus_type_code,
+                channel,
+                message_id,
+                dlc,
+                payload_len,
+                flags_len,
+                source_len,
+                metadata_len,
+            ) = _BINARY_RECORD_HEADER.unpack_from(record, 0)
+            data_offset = _BINARY_RECORD_HEADER.size
+            frame_payload = bytes(record[data_offset : data_offset + payload_len])
+            data_offset += payload_len
+            flags_payload = bytes(record[data_offset : data_offset + flags_len])
+            data_offset += flags_len
+            source_payload = bytes(record[data_offset : data_offset + source_len])
+            data_offset += source_len
+            metadata_payload = bytes(record[data_offset : data_offset + metadata_len])
+            bus_type = _BUS_TYPE_FROM_CODE.get(bus_type_code)
+            if bus_type is None:
+                raise TraceFormatError(f"未知的总线类型编码：{bus_type_code}")
+            events.append(
+                FrameEvent(
+                    ts_ns=int(ts_ns),
+                    bus_type=bus_type,
+                    channel=int(channel),
+                    message_id=int(message_id),
+                    payload=frame_payload,
+                    dlc=int(dlc),
+                    flags=json.loads(flags_payload.decode("utf-8")) if flags_len else {},
+                    source_file=source_payload.decode("utf-8"),
+                    metadata=json.loads(metadata_payload.decode("utf-8")) if metadata_len else {},
+                )
+            )
+            offset = record_end
+        return events
+
     def _load_asc(self, path: Path) -> List[FrameEvent]:
         events: List[FrameEvent] = []
         for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = raw_line.strip()
-            if not line or line.startswith("//") or line.startswith("date "):
+            lower = line.lower()
+            if (
+                not line
+                or line.startswith("//")
+                or lower.startswith("date ")
+                or lower.startswith("base ")
+                or lower.endswith("internal events logged")
+                or lower.startswith("begin triggerblock")
+                or lower.startswith("end triggerblock")
+            ):
                 continue
-            match = ASC_LINE.match(line)
-            if match is None:
+            event = self._parse_asc_event(line, path)
+            if event is None:
                 continue
-            payload_hex = match.group("data").strip()
-            payload = bytes.fromhex(payload_hex) if payload_hex else b""
-            message_id = int(match.group("msgid"), 16)
-            if match.group("ext"):
-                message_id |= 1 << 31
-            event = FrameEvent(
-                ts_ns=int(float(match.group("ts")) * 1_000_000_000),
-                bus_type=BusType.CANFD if len(payload) > 8 else BusType.CAN,
-                channel=max(int(match.group("channel")) - 1, 0),
-                message_id=message_id,
-                payload=payload,
-                dlc=int(match.group("dlc")),
-                flags={"direction": match.group("direction")},
-                source_file=str(path),
-            )
             events.append(event)
         if not events:
             raise TraceFormatError(f"在 {path} 中未找到可识别的 ASC 帧。")
         return sorted(events, key=lambda item: item.ts_ns)
+
+    def _parse_asc_event(self, line: str, path: Path) -> Optional[FrameEvent]:
+        tokens = line.split()
+        if len(tokens) < 5:
+            return None
+        try:
+            ts_ns = int(float(tokens[0]) * 1_000_000_000)
+        except ValueError:
+            return None
+        if tokens[1].upper() == "CANFD":
+            return self._parse_asc_canfd_data_frame(tokens, ts_ns, path)
+        if tokens[1].isdigit():
+            return self._parse_asc_can_data_frame(tokens, ts_ns, path)
+        return None
+
+    def _parse_asc_can_data_frame(
+        self, tokens: Sequence[str], ts_ns: int, path: Path
+    ) -> Optional[FrameEvent]:
+        direction_index = self._find_direction_index(tokens, start=3)
+        if direction_index is None or direction_index + 2 >= len(tokens):
+            return None
+        if tokens[direction_index + 1].lower() != "d":
+            return None
+        try:
+            channel = max(int(tokens[1]) - 1, 0)
+            direction = self._normalize_direction(tokens[direction_index])
+            message_id = self._parse_message_id(tokens[2])
+            dlc = self._parse_number(tokens[direction_index + 2], base=16)
+            data_start = direction_index + 3
+            data_end = data_start + dlc
+            if dlc < 0 or data_end > len(tokens):
+                return None
+            payload = bytes(
+                self._parse_number(token, base=16) for token in tokens[data_start:data_end]
+            )
+        except ValueError:
+            return None
+        flags = {"direction": direction}
+        metadata = {}
+        symbolic_name = " ".join(tokens[3:direction_index]).strip()
+        if symbolic_name:
+            metadata["symbolic_name"] = symbolic_name
+        return FrameEvent(
+            ts_ns=ts_ns,
+            bus_type=BusType.CAN,
+            channel=channel,
+            message_id=message_id,
+            payload=payload,
+            dlc=dlc,
+            flags=flags,
+            source_file=str(path),
+            metadata=metadata,
+        )
+
+    def _parse_asc_canfd_data_frame(
+        self, tokens: Sequence[str], ts_ns: int, path: Path
+    ) -> Optional[FrameEvent]:
+        if len(tokens) < 10:
+            return None
+        control_index = self._find_canfd_control_index(tokens, start=5)
+        if control_index is None or control_index + 3 >= len(tokens):
+            return None
+        try:
+            channel = max(int(tokens[2]) - 1, 0)
+            direction = self._normalize_direction(tokens[3])
+            message_id = self._parse_message_id(tokens[4])
+            brs = self._parse_binary_flag(tokens[control_index])
+            esi = self._parse_binary_flag(tokens[control_index + 1])
+            dlc = self._parse_number(tokens[control_index + 2], base=16)
+            data_length = int(tokens[control_index + 3], 10)
+            data_start = control_index + 4
+            data_end = data_start + data_length
+            if data_length < 0 or data_end > len(tokens):
+                return None
+            payload = bytes(
+                self._parse_number(token, base=16) for token in tokens[data_start:data_end]
+            )
+        except ValueError:
+            return None
+        metadata = {}
+        symbolic_name = " ".join(tokens[5:control_index]).strip()
+        if symbolic_name:
+            metadata["symbolic_name"] = symbolic_name
+        return FrameEvent(
+            ts_ns=ts_ns,
+            bus_type=BusType.CANFD,
+            channel=channel,
+            message_id=message_id,
+            payload=payload,
+            dlc=dlc,
+            flags={"direction": direction, "brs": brs, "esi": esi},
+            source_file=str(path),
+            metadata=metadata,
+        )
+
+    def _find_direction_index(
+        self, tokens: Sequence[str], start: int
+    ) -> Optional[int]:
+        for index in range(start, len(tokens)):
+            if tokens[index].lower() in ASC_DIRECTIONS:
+                return index
+        return None
+
+    def _find_canfd_control_index(
+        self, tokens: Sequence[str], start: int
+    ) -> Optional[int]:
+        for index in range(start, len(tokens) - 3):
+            if not self._is_binary_flag(tokens[index]) or not self._is_binary_flag(tokens[index + 1]):
+                continue
+            if not self._is_number(tokens[index + 2], base=16):
+                continue
+            if not self._is_number(tokens[index + 3], base=10):
+                continue
+            return index
+        return None
+
+    def _normalize_direction(self, token: str) -> str:
+        lower = token.lower()
+        if lower == "rx":
+            return "Rx"
+        if lower == "tx":
+            return "Tx"
+        raise ValueError(token)
+
+    def _parse_binary_flag(self, token: str) -> bool:
+        if token == "0":
+            return False
+        if token == "1":
+            return True
+        raise ValueError(token)
+
+    def _is_binary_flag(self, token: str) -> bool:
+        return token in {"0", "1"}
+
+    def _parse_message_id(self, token: str) -> int:
+        extended = token.endswith(("x", "X"))
+        raw_token = token[:-1] if extended else token
+        message_id = self._parse_number(raw_token, base=16)
+        if extended:
+            message_id |= 1 << 31
+        return message_id
+
+    def _parse_number(self, token: str, base: int) -> int:
+        if token.lower().startswith("0x"):
+            return int(token, 16)
+        return int(token, base)
+
+    def _is_number(self, token: str, base: int) -> bool:
+        try:
+            self._parse_number(token, base=base)
+        except ValueError:
+            return False
+        return True
 
     def _load_blf(self, path: Path) -> List[FrameEvent]:
         try:

@@ -2,17 +2,77 @@ from __future__ import annotations
 
 import unittest
 
+import tests.bootstrap  # noqa: F401
+
 from replay_platform.ui.main_window import (
+    _assess_scenario_launch,
+    _binding_summary,
+    _frame_enable_rule_summary,
+    _build_scenario_delete_summary,
+    _build_runtime_visibility_summary,
+    _build_scenario_business_summary,
+    _build_json_preview,
+    _build_scenario_counts_summary,
+    _build_scenario_selection_summary,
+    _build_trace_delete_summary,
+    _build_trace_selection_summary,
+    _filter_scenarios,
+    _filter_trace_records,
     _parse_bool_text,
     _parse_hex_bytes_text,
     _parse_int_text,
     _parse_json_object_text,
     _parse_scalar_text,
+    _playback_button_state,
     _plan_log_refresh,
+    _scenario_payload_is_dirty,
+    _should_reset_current_scenario_after_delete,
+    _validate_binding_draft,
+)
+from replay_platform.core import (
+    AdapterHealth,
+    FrameEnableRule,
+    ReplayLaunchSource,
+    ReplayRuntimeSnapshot,
+    ReplayState,
+    ScenarioSpec,
+    TimelineKind,
+    TraceFileRecord,
 )
 
 
 class MainWindowHelperTests(unittest.TestCase):
+    def test_scenario_payload_dirty_ignores_metadata_key_order(self) -> None:
+        saved_payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {"a": 1, "b": 2},
+        }
+        current_payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {"b": 2, "a": 1},
+        }
+
+        self.assertFalse(_scenario_payload_is_dirty(current_payload, saved_payload))
+        changed_payload = dict(current_payload)
+        changed_payload["name"] = "已修改"
+        self.assertTrue(_scenario_payload_is_dirty(changed_payload, saved_payload))
+
     def test_parse_int_supports_hex(self) -> None:
         self.assertEqual(_parse_int_text("0x7E0", "tx_id"), 0x7E0)
         self.assertEqual(_parse_int_text("42", "port"), 42)
@@ -42,6 +102,325 @@ class MainWindowHelperTests(unittest.TestCase):
 
     def test_plan_log_refresh_appends_from_cursor_offset(self) -> None:
         self.assertEqual(("append", 3), _plan_log_refresh(8, 5, 10))
+
+    def test_validate_binding_draft_reports_required_bool_and_json_errors(self) -> None:
+        binding_payload = {
+            "adapter_id": "",
+            "driver": "zlg",
+            "logical_channel": "0",
+            "physical_channel": "0",
+            "bus_type": "CANFD",
+            "device_type": "USBCANFD",
+            "device_index": "0",
+            "sdk_root": "zlgcan_python_251211",
+            "nominal_baud": "500000",
+            "data_baud": "2000000",
+            "resistance_enabled": "maybe",
+            "listen_only": False,
+            "tx_echo": False,
+            "merge_receive": False,
+            "network": "[]",
+            "metadata": "{}",
+        }
+
+        normalized, issues = _validate_binding_draft(binding_payload, 0)
+
+        self.assertIsNone(normalized)
+        self.assertEqual(
+            ["bindings[0].adapter_id", "bindings[0].resistance_enabled", "bindings[0].network"],
+            [issue.path for issue in issues],
+        )
+
+    def test_build_json_preview_uses_last_valid_payload_when_errors_exist(self) -> None:
+        last_valid_payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {"mode": "preview"},
+        }
+
+        note, preview = _build_json_preview(last_valid_payload, 2)
+
+        self.assertEqual("当前表单存在 2 个错误，预览未更新。", note)
+        self.assertIn('"mode": "preview"', preview)
+
+    def test_binding_summary_formats_compact_label(self) -> None:
+        binding_payload = {
+            "adapter_id": "zlg0",
+            "driver": "zlg",
+            "logical_channel": "0",
+            "physical_channel": "1",
+            "bus_type": "CANFD",
+            "device_type": "USBCANFD",
+        }
+
+        self.assertEqual("zlg0 | zlg | LC0->PC1 | CANFD/USBCANFD", _binding_summary(binding_payload))
+
+    def test_frame_enable_rule_summary_formats_compact_label(self) -> None:
+        rule = FrameEnableRule(logical_channel=1, message_id=0x123, enabled=False)
+
+        self.assertEqual("LC1 | 0x123 | 禁用", _frame_enable_rule_summary(rule))
+
+    def test_assess_scenario_launch_prefers_bound_trace_files(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": ["trace-a", "trace-b"],
+            "bindings": [
+                {
+                    "adapter_id": "mock0",
+                    "driver": "mock",
+                    "logical_channel": 0,
+                    "physical_channel": 0,
+                    "bus_type": "CAN",
+                    "device_type": "MOCK",
+                }
+            ],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+
+        result = _assess_scenario_launch(payload, ["fallback-trace"])
+
+        self.assertTrue(result.ready)
+        self.assertEqual("已就绪", result.badge_text)
+        self.assertEqual("启动来源：将使用场景内已绑定文件启动。", result.source_text)
+        self.assertEqual("场景已绑定回放文件。", result.detail_text)
+
+    def test_assess_scenario_launch_uses_selected_trace_fallback(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [
+                {
+                    "adapter_id": "mock0",
+                    "driver": "mock",
+                    "logical_channel": 0,
+                    "physical_channel": 0,
+                    "bus_type": "CAN",
+                    "device_type": "MOCK",
+                }
+            ],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+
+        result = _assess_scenario_launch(payload, ["fallback-trace"])
+
+        self.assertTrue(result.ready)
+        self.assertEqual("启动来源：将使用主窗口当前选中的文件启动。", result.source_text)
+        self.assertEqual("将回退到主窗口当前选中的文件。", result.detail_text)
+
+    def test_assess_scenario_launch_requires_trace_and_bindings(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+
+        result = _assess_scenario_launch(payload, [])
+
+        self.assertFalse(result.ready)
+        self.assertEqual("未就绪", result.badge_text)
+        self.assertIn("缺少可回放文件。", result.issue_text)
+        self.assertIn("场景未配置任何通道绑定。", result.issue_text)
+
+    def test_playback_button_state_matches_state_matrix(self) -> None:
+        stopped_ready = _playback_button_state(ReplayState.STOPPED, True)
+        stopped_unready = _playback_button_state(ReplayState.STOPPED, False)
+        running = _playback_button_state(ReplayState.RUNNING, True)
+        paused = _playback_button_state(ReplayState.PAUSED, True)
+
+        self.assertEqual((True, False, False, False), tuple(stopped_ready.__dict__.values()))
+        self.assertEqual((False, False, False, False), tuple(stopped_unready.__dict__.values()))
+        self.assertEqual((False, True, False, True), tuple(running.__dict__.values()))
+        self.assertEqual((False, False, True, True), tuple(paused.__dict__.values()))
+
+    def test_build_scenario_counts_summary_uses_payload_lengths(self) -> None:
+        payload = {
+            "trace_file_ids": ["trace-a", "trace-b"],
+            "bindings": [{"adapter_id": "mock0"}],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [{}, {}],
+            "diagnostic_actions": [{}],
+            "link_actions": [{}, {}, {}],
+        }
+
+        summary = _build_scenario_counts_summary(payload)
+
+        self.assertEqual("文件 2 个 | 绑定 1 条 | 诊断目标 2 个 | 诊断动作 1 条 | 链路动作 3 条", summary)
+
+    def test_build_scenario_business_summary_uses_file_names_and_binding_info(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": ["trace-a", "trace-missing"],
+            "bindings": [
+                {
+                    "adapter_id": "mock0",
+                    "driver": "mock",
+                    "logical_channel": 0,
+                    "physical_channel": 1,
+                    "bus_type": "CANFD",
+                    "device_type": "MOCK",
+                }
+            ],
+            "database_bindings": [{"logical_channel": 0, "path": "/tmp/vehicle.dbc", "format": "dbc"}],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+        trace_lookup = {
+            "trace-a": TraceFileRecord(
+                trace_id="trace-a",
+                name="can.asc",
+                original_path="/tmp/can.asc",
+                library_path="/tmp/cache.asc",
+                format="asc",
+                imported_at="now",
+            )
+        }
+
+        summary = _build_scenario_business_summary(payload, trace_lookup)
+
+        self.assertEqual("回放文件：can.asc，缺失文件（trace-missing）", summary.trace_text)
+        self.assertEqual("通道绑定：LC0 -> mock0/PC1 CANFD", summary.binding_text)
+        self.assertEqual("数据库绑定：LC0 -> vehicle.dbc", summary.database_text)
+
+    def test_filter_helpers_use_case_insensitive_contains(self) -> None:
+        traces = [
+            TraceFileRecord("t1", "Body.asc", "", "", "asc", "now"),
+            TraceFileRecord("t2", "Powertrain.asc", "", "", "asc", "now"),
+        ]
+        scenario_records = [
+            type("ScenarioLike", (), {"name": "Body Replay"})(),
+            type("ScenarioLike", (), {"name": "Diag Case"})(),
+        ]
+
+        self.assertEqual(["Body.asc"], [item.name for item in _filter_trace_records(traces, "body")])
+        self.assertEqual(["Body Replay"], [item.name for item in _filter_scenarios(scenario_records, "body")])
+
+    def test_build_trace_selection_summary_reports_counts_and_span(self) -> None:
+        records = [
+            TraceFileRecord("t1", "a.asc", "", "", "asc", "now", event_count=10, start_ns=0, end_ns=5_000_000),
+            TraceFileRecord("t2", "b.asc", "", "", "asc", "now", event_count=5, start_ns=1_000_000, end_ns=9_000_000),
+        ]
+
+        summary = _build_trace_selection_summary(records)
+
+        self.assertIn("已选 2 个文件", summary)
+        self.assertIn("累计 15 帧", summary)
+        self.assertIn("9.000 ms", summary)
+
+    def test_build_trace_delete_summary_reports_references(self) -> None:
+        record = TraceFileRecord(
+            "t1",
+            "body.asc",
+            "",
+            "",
+            "asc",
+            "now",
+            event_count=18,
+            start_ns=0,
+            end_ns=20_000_000,
+        )
+        scenarios = [
+            ScenarioSpec(scenario_id="scenario-1", name="Body Replay", trace_file_ids=["t1"]),
+            ScenarioSpec(scenario_id="scenario-2", name="Diag Replay", trace_file_ids=["t1"]),
+        ]
+
+        summary = _build_trace_delete_summary(record, scenarios)
+
+        self.assertIn("文件：body.asc", summary)
+        self.assertIn("帧数：18", summary)
+        self.assertIn("20.000 ms", summary)
+        self.assertIn("仍被 2 个场景引用", summary)
+        self.assertIn("Body Replay", summary)
+
+    def test_build_scenario_selection_summary_reports_selected_counts(self) -> None:
+        scenario = type(
+            "ScenarioLike",
+            (),
+            {
+                "name": "Body Replay",
+                "trace_file_ids": ["t1"],
+                "bindings": [object(), object()],
+                "database_bindings": [object()],
+                "diagnostic_actions": [object(), object(), object()],
+            },
+        )()
+
+        summary = _build_scenario_selection_summary(scenario)
+
+        self.assertEqual("Body Replay | 文件 1 | 绑定 2 | 数据库 1 | 诊断动作 3", summary)
+
+    def test_build_scenario_delete_summary_uses_business_counts(self) -> None:
+        scenario = ScenarioSpec(
+            scenario_id="scenario-1",
+            name="Body Replay",
+            trace_file_ids=["t1"],
+            bindings=[object()],  # type: ignore[list-item]
+            diagnostic_actions=[object(), object()],  # type: ignore[list-item]
+        )
+
+        summary = _build_scenario_delete_summary(scenario)
+
+        self.assertIn("场景：Body Replay", summary)
+        self.assertIn("文件 1", summary)
+        self.assertIn("绑定 1", summary)
+        self.assertIn("诊断动作 2", summary)
+
+    def test_should_reset_current_scenario_after_delete_matches_ids(self) -> None:
+        current_payload = {"scenario_id": "scenario-1", "name": "Body Replay"}
+
+        self.assertTrue(_should_reset_current_scenario_after_delete(current_payload, "scenario-1"))
+        self.assertFalse(_should_reset_current_scenario_after_delete(current_payload, "scenario-2"))
+
+    def test_build_runtime_visibility_summary_formats_snapshot_details(self) -> None:
+        snapshot = ReplayRuntimeSnapshot(
+            state=ReplayState.RUNNING,
+            current_ts_ns=5_000_000,
+            total_ts_ns=10_000_000,
+            timeline_index=1,
+            timeline_size=4,
+            current_item_kind=TimelineKind.FRAME,
+            current_source_file="body.asc",
+            launch_source=ReplayLaunchSource.SELECTED_FALLBACK,
+        )
+        snapshot.adapter_health["mock0"] = AdapterHealth(online=True, detail="ok", per_channel={0: True})
+        bindings = [{"adapter_id": "mock0", "logical_channel": 0, "physical_channel": 0}]
+
+        summary = _build_runtime_visibility_summary(snapshot, bindings)
+
+        self.assertEqual("进度 50.0% | 当前时间 5.000 ms / 10.000 ms", summary.progress_text)
+        self.assertEqual("当前来源：body.asc", summary.source_text)
+        self.assertIn("mock0 在线", summary.device_text)
+        self.assertEqual("启动来源：主窗口选中文件回退", summary.launch_text)
 
 
 if __name__ == "__main__":

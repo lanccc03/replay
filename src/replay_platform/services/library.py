@@ -4,13 +4,27 @@ import json
 import shutil
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 from replay_platform.core import ScenarioSpec, TraceFileRecord
 from replay_platform.paths import AppPaths
-from replay_platform.services.trace_loader import TraceLoader
+from replay_platform.services.trace_loader import (
+    BINARY_CACHE_FORMAT,
+    BINARY_CACHE_SUFFIX,
+    TraceLoader,
+)
+
+
+@dataclass(frozen=True)
+class DeleteTraceResult:
+    trace_id: str
+    name: str
+    deleted_library_file: bool
+    deleted_cache_file: bool
+    referenced_by: list[str]
 
 
 class FileLibraryService:
@@ -62,8 +76,8 @@ class FileLibraryService:
         imported_at = datetime.now(timezone.utc).isoformat()
         events = self.trace_loader.load(str(dest))
         summary = self.trace_loader.summarize(events)
-        cache_path = self.paths.cache_dir / f"{trace_id}.json"
-        self.trace_loader.write_cache(cache_path, events)
+        cache_path = self._binary_cache_path(trace_id)
+        self.trace_loader.write_binary_cache(cache_path, events)
         record = TraceFileRecord(
             trace_id=trace_id,
             name=src.name,
@@ -74,7 +88,10 @@ class FileLibraryService:
             event_count=summary.event_count,
             start_ns=summary.start_ns,
             end_ns=summary.end_ns,
-            metadata={"cache_path": str(cache_path)},
+            metadata={
+                "cache_path": str(cache_path),
+                "cache_format": BINARY_CACHE_FORMAT,
+            },
         )
         with self._connect() as connection:
             connection.execute(
@@ -151,17 +168,83 @@ class FileLibraryService:
             metadata=json.loads(row[9]),
         )
 
+    def find_scenarios_referencing_trace(self, trace_id: str) -> List[ScenarioSpec]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT body_json FROM scenarios ORDER BY updated_at DESC"
+            ).fetchall()
+        scenarios: list[ScenarioSpec] = []
+        for row in rows:
+            scenario = ScenarioSpec.from_dict(json.loads(row[0]))
+            if trace_id in scenario.trace_file_ids:
+                scenarios.append(scenario)
+        return scenarios
+
     def load_trace_events(self, trace_id: str):
         record = self.get_trace_file(trace_id)
         if record is None:
             raise FileNotFoundError(trace_id)
         cache_path = Path(record.metadata.get("cache_path", ""))
+        cache_format = str(record.metadata.get("cache_format", ""))
         if cache_path.exists():
-            return self.trace_loader.load_cache(cache_path)
+            if cache_format == BINARY_CACHE_FORMAT or cache_path.suffix == BINARY_CACHE_SUFFIX:
+                return self.trace_loader.load_binary_cache(cache_path)
+            events = self.trace_loader.load_cache(cache_path)
+            self._write_binary_cache(trace_id, record.metadata, events)
+            return events
         events = self.trace_loader.load(record.library_path)
-        if cache_path:
-            self.trace_loader.write_cache(cache_path, events)
+        self._write_binary_cache(trace_id, record.metadata, events)
         return events
+
+    def _binary_cache_path(self, trace_id: str) -> Path:
+        return self.paths.cache_dir / f"{trace_id}{BINARY_CACHE_SUFFIX}"
+
+    def _write_binary_cache(
+        self,
+        trace_id: str,
+        metadata: dict,
+        events,
+    ) -> None:
+        cache_path = self._binary_cache_path(trace_id)
+        self.trace_loader.write_binary_cache(cache_path, events)
+        updated_metadata = dict(metadata)
+        updated_metadata["cache_path"] = str(cache_path)
+        updated_metadata["cache_format"] = BINARY_CACHE_FORMAT
+        self._update_trace_metadata(trace_id, updated_metadata)
+
+    def _update_trace_metadata(self, trace_id: str, metadata: dict) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE trace_files
+                SET metadata_json = ?
+                WHERE trace_id = ?
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=True),
+                    trace_id,
+                ),
+            )
+
+    def delete_trace(self, trace_id: str) -> DeleteTraceResult:
+        record = self.get_trace_file(trace_id)
+        if record is None:
+            raise FileNotFoundError(trace_id)
+        referenced_by = [scenario.name for scenario in self.find_scenarios_referencing_trace(trace_id)]
+        deleted_library_file = self._unlink_if_exists(record.library_path)
+        deleted_cache_file = self._unlink_if_exists(record.metadata.get("cache_path", ""))
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM trace_files WHERE trace_id = ?",
+                (trace_id,),
+            )
+        return DeleteTraceResult(
+            trace_id=trace_id,
+            name=record.name,
+            deleted_library_file=deleted_library_file,
+            deleted_cache_file=deleted_cache_file,
+            referenced_by=referenced_by,
+        )
 
     def save_scenario(self, scenario: ScenarioSpec) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -199,6 +282,15 @@ class FileLibraryService:
                     ),
                 )
 
+    def delete_scenario(self, scenario_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM scenarios WHERE scenario_id = ?",
+                (scenario_id,),
+            )
+            if cursor.rowcount == 0:
+                raise FileNotFoundError(scenario_id)
+
     def list_scenarios(self) -> List[ScenarioSpec]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -216,3 +308,13 @@ class FileLibraryService:
             raise FileNotFoundError(scenario_id)
         return ScenarioSpec.from_dict(json.loads(row[0]))
 
+    @staticmethod
+    def _unlink_if_exists(raw_path: str) -> bool:
+        if not raw_path:
+            return False
+        path = Path(raw_path)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True

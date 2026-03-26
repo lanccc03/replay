@@ -10,5 +10,5 @@ name = "运行"
 icon = "run"
 command = '''
 source /Users/lanyy/Code/replay/.venv/bin/activate.fish
-replay-playform
+replay-platform
 '''

@@ -18,6 +18,9 @@ ALIAS_KEYWORDS = {
 
 
 class MessageCodec(Protocol):
+    def message_ids(self) -> List[int]:
+        ...
+
     def supports(self, message_id: int) -> bool:
         ...
 
@@ -48,6 +51,9 @@ class StaticMessageCodec:
 
     def supports(self, message_id: int) -> bool:
         return message_id in self.definitions
+
+    def message_ids(self) -> List[int]:
+        return sorted(self.definitions)
 
     def decode(self, message_id: int, payload: bytes) -> Dict[str, Any]:
         definition = self.definitions[message_id]
@@ -94,6 +100,9 @@ class CantoolsSignalCatalog:
     def supports(self, message_id: int) -> bool:
         return message_id in self._messages
 
+    def message_ids(self) -> List[int]:
+        return sorted(self._messages)
+
     def decode(self, message_id: int, payload: bytes) -> Dict[str, Any]:
         message = self._messages[message_id]
         return dict(message.decode(payload, decode_choices=False, scaling=True))
@@ -115,6 +124,7 @@ class SignalOverrideService:
     def __init__(self) -> None:
         self._codecs_by_channel: Dict[int, MessageCodec] = {}
         self._overrides: Dict[tuple, SignalOverride] = {}
+        self._overrides_by_message: Dict[tuple[int, int], Dict[str, SignalOverride]] = {}
 
     def bind_codec(self, logical_channel: int, codec: MessageCodec) -> None:
         self._codecs_by_channel[logical_channel] = codec
@@ -125,12 +135,22 @@ class SignalOverrideService:
     def set_override(self, override: SignalOverride) -> None:
         key = (override.logical_channel, override.message_id_or_pgn, override.signal_name)
         self._overrides[key] = override
+        bucket_key = (override.logical_channel, override.message_id_or_pgn)
+        self._overrides_by_message.setdefault(bucket_key, {})[override.signal_name] = override
 
     def clear_override(self, logical_channel: int, message_id_or_pgn: int, signal_name: str) -> None:
         self._overrides.pop((logical_channel, message_id_or_pgn, signal_name), None)
+        bucket_key = (logical_channel, message_id_or_pgn)
+        bucket = self._overrides_by_message.get(bucket_key)
+        if bucket is None:
+            return
+        bucket.pop(signal_name, None)
+        if not bucket:
+            self._overrides_by_message.pop(bucket_key, None)
 
     def clear_all(self) -> None:
         self._overrides.clear()
+        self._overrides_by_message.clear()
 
     def list_overrides(self) -> List[SignalOverride]:
         return sorted(
@@ -140,10 +160,10 @@ class SignalOverrideService:
 
     def available_aliases(self, logical_channel: int) -> Dict[str, str]:
         codec = self._codecs_by_channel.get(logical_channel)
-        if not codec or not hasattr(codec, "_messages"):
+        if not codec:
             return {}
         aliases: Dict[str, str] = {}
-        for message_id in getattr(codec, "_messages", {}):
+        for message_id in codec.message_ids():
             for signal_name in codec.signal_names(message_id):
                 normalized = _normalize(signal_name)
                 for alias, candidates in ALIAS_KEYWORDS.items():
@@ -151,14 +171,34 @@ class SignalOverrideService:
                         aliases.setdefault(alias, signal_name)
         return aliases
 
+    def list_message_ids(self, logical_channel: int) -> List[int]:
+        codec = self._codecs_by_channel.get(logical_channel)
+        if codec is None:
+            return []
+        return codec.message_ids()
+
+    def list_signal_names(self, logical_channel: int, message_id: int) -> List[str]:
+        codec = self._codecs_by_channel.get(logical_channel)
+        if codec is None or not codec.supports(message_id):
+            return []
+        return codec.signal_names(message_id)
+
+    def message_name(self, logical_channel: int, message_id: int) -> Optional[str]:
+        codec = self._codecs_by_channel.get(logical_channel)
+        if codec is None or not codec.supports(message_id):
+            return None
+        return codec.message_name(message_id)
+
     def apply(self, event: FrameEvent) -> FrameEvent:
         codec = self._codecs_by_channel.get(event.channel)
         if codec is None or not codec.supports(event.message_id):
             return event
+        bucket = self._overrides_by_message.get((event.channel, event.message_id))
+        if not bucket:
+            return event
         changes = {
-            override.signal_name: override.value
-            for override in self._overrides.values()
-            if override.logical_channel == event.channel and override.message_id_or_pgn == event.message_id
+            signal_name: override.value
+            for signal_name, override in bucket.items()
         }
         if not changes:
             return event

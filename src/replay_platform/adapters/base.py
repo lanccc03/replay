@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 from replay_platform.core import (
     AdapterCapabilities,
@@ -42,6 +42,9 @@ class DeviceAdapter(ABC):
     @abstractmethod
     def send(self, batch: Sequence[FrameEvent]) -> int:
         raise NotImplementedError
+
+    def send_scheduled(self, batch: Sequence[FrameEvent], enqueue_base_ns: int) -> int:
+        return self.send(batch)
 
     @abstractmethod
     def read(self, limit: int = 256, timeout_ms: int = 0) -> List[FrameEvent]:
@@ -84,4 +87,3 @@ class DiagnosticClient(ABC):
     @abstractmethod
     def reconnect(self) -> None:
         raise NotImplementedError
-

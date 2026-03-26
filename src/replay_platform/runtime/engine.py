@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
+from pathlib import Path
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Deque, Dict, List, Optional, Sequence
 
 from replay_platform.adapters.base import DeviceAdapter, DiagnosticClient
 from replay_platform.core import (
+    AdapterHealth,
     BusType,
     ChannelConfig,
     ChannelDescriptor,
@@ -15,18 +18,32 @@ from replay_platform.core import (
     FrameEvent,
     LinkAction,
     LinkActionType,
+    ReplayFrameLogMode,
+    ReplayLaunchSource,
+    ReplayLogConfig,
+    ReplayLogLevel,
+    ReplayRuntimeSnapshot,
     ReplayState,
     ReplayStats,
     ScenarioSpec,
     TimelineItem,
+    TimelineKind,
     UdsRequest,
 )
 from replay_platform.errors import ConfigurationError
+from replay_platform.services.frame_enable import FrameEnableService
 from replay_platform.services.signal_catalog import SignalOverrideService
 
 
 FRAME_SLICE_WINDOW_NS = 2_000_000
+FRAME_QUEUE_LOOKAHEAD_NS = 20_000_000
 FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
+SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.J1939})
+LOG_LEVEL_PRIORITY = {
+    ReplayLogLevel.WARNING: 1,
+    ReplayLogLevel.INFO: 2,
+    ReplayLogLevel.DEBUG: 3,
+}
 
 
 @dataclass(frozen=True)
@@ -41,10 +58,14 @@ class ReplayEngine:
     def __init__(
         self,
         signal_overrides: Optional[SignalOverrideService] = None,
+        frame_enables: Optional[FrameEnableService] = None,
         logger: Optional[Callable[[str], None]] = None,
+        log_config: Optional[ReplayLogConfig] = None,
     ) -> None:
         self.signal_overrides = signal_overrides or SignalOverrideService()
+        self.frame_enables = frame_enables or FrameEnableService()
         self.logger = logger or (lambda _message: None)
+        self.log_config = log_config or ReplayLogConfig()
         self.state = ReplayState.STOPPED
         self.stats = ReplayStats()
         self._scenario: Optional[ScenarioSpec] = None
@@ -52,11 +73,20 @@ class ReplayEngine:
         self._adapters: Dict[str, DeviceAdapter] = {}
         self._diagnostics: Dict[str, DiagnosticClient] = {}
         self._thread: Optional[threading.Thread] = None
+        self._diagnostic_thread: Optional[threading.Thread] = None
         self._condition = threading.Condition()
+        self._diagnostic_condition = threading.Condition()
+        self._diagnostic_queue: Deque[DiagnosticAction] = deque()
         self._stop_requested = False
+        self._diagnostic_stop_requested = False
+        self._diagnostic_active = False
         self._base_perf_ns = 0
         self._pause_started_ns = 0
         self._timeline_index = 0
+        self._stats_lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
+        self._frame_log_counts: Dict[str, int] = {}
+        self._runtime_snapshot = ReplayRuntimeSnapshot()
 
     def configure(
         self,
@@ -64,6 +94,8 @@ class ReplayEngine:
         frames: Sequence[FrameEvent],
         adapters: Dict[str, DeviceAdapter],
         diagnostics: Optional[Dict[str, DiagnosticClient]] = None,
+        *,
+        launch_source: Optional[ReplayLaunchSource] = None,
     ) -> None:
         self._scenario = scenario
         self._timeline = scenario.timeline_items(frames)
@@ -71,6 +103,19 @@ class ReplayEngine:
         self._diagnostics = diagnostics or {}
         self._timeline_index = 0
         self.stats = ReplayStats()
+        self._frame_log_counts.clear()
+        with self._diagnostic_condition:
+            self._diagnostic_queue.clear()
+            self._diagnostic_stop_requested = False
+            self._diagnostic_active = False
+        self._runtime_snapshot = ReplayRuntimeSnapshot(
+            state=self.state,
+            total_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
+            timeline_index=0,
+            timeline_size=len(self._timeline),
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            launch_source=launch_source,
+        )
 
     def start(self) -> None:
         if self._scenario is None:
@@ -79,11 +124,16 @@ class ReplayEngine:
             return
         self._prepare_channels()
         self._stop_requested = False
+        self._start_diagnostic_worker()
         self.state = ReplayState.RUNNING
         self._base_perf_ns = time.perf_counter_ns()
+        self._update_runtime_snapshot(
+            state=self.state,
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
         self._thread = threading.Thread(target=self._run_loop, name="replay-engine", daemon=True)
         self._thread.start()
-        self.logger("回放已开始。")
+        self._log_info("回放已开始。")
 
     def pause(self) -> None:
         with self._condition:
@@ -92,7 +142,11 @@ class ReplayEngine:
             self.state = ReplayState.PAUSED
             self._pause_started_ns = time.perf_counter_ns()
             self._condition.notify_all()
-        self.logger("回放已暂停。")
+        self._update_runtime_snapshot(
+            state=self.state,
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
+        self._log_info("回放已暂停。")
 
     def resume(self) -> None:
         with self._condition:
@@ -102,7 +156,11 @@ class ReplayEngine:
             self._base_perf_ns += now - self._pause_started_ns
             self.state = ReplayState.RUNNING
             self._condition.notify_all()
-        self.logger("回放已继续。")
+        self._update_runtime_snapshot(
+            state=self.state,
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
+        self._log_info("回放已继续。")
 
     def stop(self) -> None:
         with self._condition:
@@ -113,16 +171,40 @@ class ReplayEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
+        self._stop_diagnostic_worker()
         self._teardown_adapters()
         self._timeline_index = 0
-        self.logger("回放已停止。")
+        self._frame_log_counts.clear()
+        self._update_runtime_snapshot(
+            state=self.state,
+            timeline_index=0,
+            current_item_kind=None,
+            current_source_file="",
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
+        self._log_info("回放已停止。")
+
+    def snapshot(self) -> ReplayRuntimeSnapshot:
+        with self._snapshot_lock:
+            snapshot = self._runtime_snapshot
+            return ReplayRuntimeSnapshot(
+                state=snapshot.state,
+                current_ts_ns=snapshot.current_ts_ns,
+                total_ts_ns=snapshot.total_ts_ns,
+                timeline_index=snapshot.timeline_index,
+                timeline_size=snapshot.timeline_size,
+                current_item_kind=snapshot.current_item_kind,
+                current_source_file=snapshot.current_source_file,
+                adapter_health=self._copy_adapter_health_map(snapshot.adapter_health),
+                launch_source=snapshot.launch_source,
+            )
 
     def seek_to_start(self) -> None:
         if self.state == ReplayState.RUNNING:
             raise ConfigurationError("请先停止或暂停回放，再回到起点。")
         self._timeline_index = 0
         self._base_perf_ns = time.perf_counter_ns()
-        self.logger("回放位置已重置。")
+        self._log_info("回放位置已重置。")
 
     def _prepare_channels(self) -> None:
         assert self._scenario is not None
@@ -144,46 +226,23 @@ class ReplayEngine:
     ) -> Dict[int, ChannelConfig]:
         if not bindings:
             return {}
-        binding_configs = {
-            binding.physical_channel: binding.channel_config()
-            for binding in bindings
-        }
-        descriptor_bus_types = {
-            descriptor.physical_channel: descriptor.bus_type
-            for descriptor in descriptors
-        }
-        fallback_binding = bindings[0]
-        physical_channels = set(binding_configs)
-        physical_channels.update(descriptor_bus_types)
+        available_channels = {descriptor.physical_channel for descriptor in descriptors}
         start_plan: Dict[int, ChannelConfig] = {}
-        for physical_channel in sorted(physical_channels):
-            config = binding_configs.get(physical_channel)
-            if config is not None:
-                start_plan[physical_channel] = config
+        for binding in bindings:
+            if available_channels and binding.physical_channel not in available_channels:
+                raise ConfigurationError(
+                    f"适配器通道 {binding.physical_channel} 不存在，无法绑定逻辑通道 {binding.logical_channel}。"
+                )
+            config = binding.channel_config()
+            existing = start_plan.get(binding.physical_channel)
+            if existing is None:
+                start_plan[binding.physical_channel] = config
                 continue
-            start_plan[physical_channel] = self._fallback_channel_config(
-                fallback_binding,
-                descriptor_bus_types.get(physical_channel),
-            )
-        return start_plan
-
-    @staticmethod
-    def _fallback_channel_config(
-        binding: DeviceChannelBinding,
-        bus_type: Optional[BusType],
-    ) -> ChannelConfig:
-        config = binding.channel_config()
-        if bus_type is None or bus_type == config.bus_type:
-            return config
-        return ChannelConfig(
-            bus_type=bus_type,
-            nominal_baud=config.nominal_baud,
-            data_baud=config.data_baud,
-            resistance_enabled=config.resistance_enabled,
-            listen_only=config.listen_only,
-            tx_echo=config.tx_echo,
-            extra=dict(config.extra),
-        )
+            if existing != config:
+                raise ConfigurationError(
+                    f"物理通道 {binding.physical_channel} 存在冲突的启动配置。"
+                )
+        return dict(sorted(start_plan.items()))
 
     def _run_loop(self) -> None:
         while True:
@@ -194,15 +253,34 @@ class ReplayEngine:
                     self._condition.wait(timeout=0.1)
                     continue
             if self._timeline_index >= len(self._timeline):
+                self._wait_for_diagnostics_idle()
+                if self._stop_requested:
+                    return
                 self.state = ReplayState.STOPPED
                 self._teardown_adapters()
-                self.logger("回放已完成。")
+                self._update_runtime_snapshot(
+                    state=self.state,
+                    current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
+                    timeline_index=len(self._timeline),
+                    adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+                )
+                self._log_info("回放已完成。")
                 return
             frame_batch = self._frame_batch_at(self._timeline_index)
             item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
             advance_count = len(frame_batch) if frame_batch else 1
+            self._update_runtime_snapshot_for_item(item, self._timeline_index)
             target_ns = self._base_perf_ns + item.ts_ns
             now_ns = time.perf_counter_ns()
+            if frame_batch and self._should_schedule_frame_batch(frame_batch, target_ns, now_ns):
+                try:
+                    self._dispatch_frame_batch(frame_batch, scheduled=True)
+                except Exception as exc:  # pragma: no cover - defensive runtime logging
+                    self._record_error(str(exc))
+                    self._log_warning(f"回放异常：{exc}")
+                finally:
+                    self._timeline_index += advance_count
+                continue
             if now_ns < target_ns:
                 self._sleep_until(target_ns)
                 continue
@@ -212,8 +290,8 @@ class ReplayEngine:
                 else:
                     self._dispatch(item)
             except Exception as exc:  # pragma: no cover - defensive runtime logging
-                self.stats.errors.append(str(exc))
-                self.logger(f"回放异常：{exc}")
+                self._record_error(str(exc))
+                self._log_warning(f"回放异常：{exc}")
             finally:
                 self._timeline_index += advance_count
 
@@ -233,7 +311,7 @@ class ReplayEngine:
             self._dispatch_frame_batch([item])
             return
         if isinstance(item, DiagnosticAction):
-            self._dispatch_diagnostic(item)
+            self._enqueue_diagnostic(item)
             return
         if isinstance(item, LinkAction):
             self._dispatch_link(item)
@@ -259,9 +337,48 @@ class ReplayEngine:
             next_index += 1
         return batch
 
-    def _dispatch_frame_batch(self, frames: Sequence[FrameEvent]) -> None:
+    def _should_schedule_frame_batch(
+        self,
+        frames: Sequence[FrameEvent],
+        target_ns: int,
+        now_ns: int,
+    ) -> bool:
+        enabled_frames = self._enabled_frames(frames)
+        if not enabled_frames or target_ns <= now_ns or target_ns - now_ns > FRAME_QUEUE_LOOKAHEAD_NS:
+            return False
+        checked_adapters: set[str] = set()
+        for frame in enabled_frames:
+            if frame.bus_type not in SCHEDULED_FRAME_BUS_TYPES:
+                return False
+            binding = self._binding_for(frame.channel)
+            if binding is None:
+                raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
+            if binding.adapter_id in checked_adapters:
+                continue
+            adapter = self._adapters.get(binding.adapter_id)
+            if adapter is None:
+                raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
+            if not adapter.capabilities().queue_send:
+                return False
+            checked_adapters.add(binding.adapter_id)
+        return True
+
+    def _dispatch_frame_batch(self, frames: Sequence[FrameEvent], scheduled: bool = False) -> None:
+        self._send_prepared_frames(self._prepare_frame_groups(frames), scheduled=scheduled)
+
+    def _enabled_frames(self, frames: Sequence[FrameEvent]) -> List[FrameEvent]:
+        return [
+            frame
+            for frame in frames
+            if self.frame_enables.is_enabled(frame.channel, frame.message_id)
+        ]
+
+    def _prepare_frame_groups(self, frames: Sequence[FrameEvent]) -> Dict[str, List[PreparedFrame]]:
         frames_by_adapter: Dict[str, List[PreparedFrame]] = {}
         for frame in frames:
+            if not self.frame_enables.is_enabled(frame.channel, frame.message_id):
+                self._add_skipped_frames(1)
+                continue
             binding = self._binding_for(frame.channel)
             if binding is None:
                 raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
@@ -275,28 +392,44 @@ class ReplayEngine:
                     frame=mapped,
                 )
             )
+        return frames_by_adapter
+
+    def _send_prepared_frames(
+        self,
+        frames_by_adapter: Dict[str, List[PreparedFrame]],
+        scheduled: bool = False,
+    ) -> None:
         for adapter_id, adapter_frames in frames_by_adapter.items():
             adapter = self._adapters.get(adapter_id)
             if adapter is None:
                 raise ConfigurationError(f"适配器 {adapter_id} 未配置。")
-            sent = int(adapter.send([item.frame for item in adapter_frames]) or 0)
+            batch = [item.frame for item in adapter_frames]
+            if scheduled:
+                sent = int(adapter.send_scheduled(batch, self._base_perf_ns) or 0)
+            else:
+                sent = int(adapter.send(batch) or 0)
             sent_count = max(0, min(sent, len(adapter_frames)))
-            self.stats.sent_frames += sent_count
-            self.stats.skipped_frames += len(adapter_frames) - sent_count
+            self._add_sent_frames(sent_count)
+            self._add_skipped_frames(len(adapter_frames) - sent_count)
             for item in adapter_frames[:sent_count]:
                 self._log_sent_frame(item)
             if sent_count < len(adapter_frames):
-                self.logger(
+                self._log_warning(
                     f"回放帧发送未完成：适配器={adapter_id} 已发 {sent_count}/{len(adapter_frames)}"
                 )
+
+    def _enqueue_diagnostic(self, action: DiagnosticAction) -> None:
+        with self._diagnostic_condition:
+            self._diagnostic_queue.append(action)
+            self._diagnostic_condition.notify_all()
 
     def _dispatch_diagnostic(self, action: DiagnosticAction) -> None:
         client = self._diagnostics.get(action.target)
         if client is None:
             raise ConfigurationError(f'未找到名为 "{action.target}" 的诊断目标。')
         response = client.request(UdsRequest(action.service_id, action.payload, action.timeout_ms))
-        self.stats.diagnostic_actions += 1
-        self.logger(
+        self._increment_diagnostic_actions()
+        self._log_info(
             f"诊断 {action.target} SID=0x{action.service_id:02X} "
             f"{'正响应' if response.positive else '负响应'}"
         )
@@ -320,18 +453,88 @@ class ReplayEngine:
                 binding = self._binding_for(action.logical_channel)
                 if binding is not None:
                     adapter.start_channel(binding.physical_channel, binding.channel_config())
-        self.stats.link_actions += 1
+        self._increment_link_actions()
         action_name = "断开" if action.action == LinkActionType.DISCONNECT else "恢复"
-        self.logger(f"链路动作：{action.adapter_id} 已处理{action_name}。")
+        self._log_info(f"链路动作：{action.adapter_id} 已处理{action_name}。")
+
+    def _start_diagnostic_worker(self) -> None:
+        with self._diagnostic_condition:
+            self._diagnostic_queue.clear()
+            self._diagnostic_stop_requested = False
+            self._diagnostic_active = False
+        if not self._diagnostics:
+            self._diagnostic_thread = None
+            return
+        self._diagnostic_thread = threading.Thread(
+            target=self._diagnostic_loop,
+            name="replay-diagnostics",
+            daemon=True,
+        )
+        self._diagnostic_thread.start()
+
+    def _stop_diagnostic_worker(self) -> None:
+        pending = 0
+        with self._diagnostic_condition:
+            pending = len(self._diagnostic_queue)
+            self._diagnostic_queue.clear()
+            self._diagnostic_stop_requested = True
+            self._diagnostic_condition.notify_all()
+        if pending:
+            self._log_warning(f"诊断队列已取消 {pending} 条未执行动作。")
+        if self._diagnostic_thread and self._diagnostic_thread.is_alive():
+            self._diagnostic_thread.join(timeout=2.0)
+        self._diagnostic_thread = None
+
+    def _diagnostic_loop(self) -> None:
+        while True:
+            with self._diagnostic_condition:
+                while not self._diagnostic_queue and not self._diagnostic_stop_requested:
+                    self._diagnostic_condition.wait(timeout=0.1)
+                if self._diagnostic_stop_requested and not self._diagnostic_queue:
+                    return
+                action = self._diagnostic_queue.popleft()
+                self._diagnostic_active = True
+            try:
+                self._dispatch_diagnostic(action)
+            except Exception as exc:  # pragma: no cover - defensive runtime logging
+                self._record_error(str(exc))
+                self._log_warning(f"诊断异常：{exc}")
+            finally:
+                with self._diagnostic_condition:
+                    self._diagnostic_active = False
+                    self._diagnostic_condition.notify_all()
+
+    def _wait_for_diagnostics_idle(self) -> None:
+        while True:
+            with self._diagnostic_condition:
+                if (not self._diagnostic_queue and not self._diagnostic_active) or self._stop_requested:
+                    return
+            time.sleep(0.01)
 
     def _binding_for(self, logical_channel: int) -> Optional[DeviceChannelBinding]:
         assert self._scenario is not None
         return self._scenario.find_binding(logical_channel)
 
     def _log_sent_frame(self, item: PreparedFrame) -> None:
-        if item.frame.bus_type not in FRAME_LOG_BUS_TYPES:
+        if not self._should_log_frame(item):
             return
-        self.logger(
+        self._log_debug(self._format_sent_frame_log(item))
+
+    def _should_log_frame(self, item: PreparedFrame) -> bool:
+        if item.frame.bus_type not in FRAME_LOG_BUS_TYPES:
+            return False
+        if not self._should_emit(ReplayLogLevel.DEBUG):
+            return False
+        if self.log_config.frame_mode == ReplayFrameLogMode.OFF:
+            return False
+        count = self._frame_log_counts.get(item.adapter_id, 0) + 1
+        self._frame_log_counts[item.adapter_id] = count
+        if self.log_config.frame_mode == ReplayFrameLogMode.ALL:
+            return True
+        return count % self.log_config.frame_sample_rate == 0
+
+    def _format_sent_frame_log(self, item: PreparedFrame) -> str:
+        return (
             "回放帧 [{bus}] t={ts_ms:.3f}ms 适配器={adapter} 逻辑通道={logical} "
             "物理通道={physical} ID=0x{id:X} DLC={dlc} DATA={data}".format(
                 bus=item.frame.bus_type.value,
@@ -350,4 +553,81 @@ class ReplayEngine:
             try:
                 adapter.close()
             except Exception as exc:  # pragma: no cover - defensive cleanup
-                self.logger(f"适配器关闭失败：{exc}")
+                self._log_warning(f"适配器关闭失败：{exc}")
+
+    def _should_emit(self, level: ReplayLogLevel) -> bool:
+        return LOG_LEVEL_PRIORITY[level] <= LOG_LEVEL_PRIORITY[self.log_config.level]
+
+    def _log_warning(self, message: str) -> None:
+        if self._should_emit(ReplayLogLevel.WARNING):
+            self.logger(message)
+
+    def _log_info(self, message: str) -> None:
+        if self._should_emit(ReplayLogLevel.INFO):
+            self.logger(message)
+
+    def _log_debug(self, message: str) -> None:
+        if self._should_emit(ReplayLogLevel.DEBUG):
+            self.logger(message)
+
+    def _add_sent_frames(self, count: int) -> None:
+        with self._stats_lock:
+            self.stats.sent_frames += count
+
+    def _add_skipped_frames(self, count: int) -> None:
+        with self._stats_lock:
+            self.stats.skipped_frames += count
+
+    def _increment_diagnostic_actions(self) -> None:
+        with self._stats_lock:
+            self.stats.diagnostic_actions += 1
+
+    def _increment_link_actions(self) -> None:
+        with self._stats_lock:
+            self.stats.link_actions += 1
+
+    def _record_error(self, message: str) -> None:
+        with self._stats_lock:
+            self.stats.errors.append(message)
+
+    def _update_runtime_snapshot(self, **updates) -> None:
+        with self._snapshot_lock:
+            self._runtime_snapshot = replace(self._runtime_snapshot, **updates)
+
+    def _update_runtime_snapshot_for_item(self, item: TimelineItem, timeline_index: int) -> None:
+        current_source = ""
+        if isinstance(item, FrameEvent):
+            current_source = Path(item.source_file).name if item.source_file else ""
+        elif isinstance(item, DiagnosticAction):
+            current_source = "诊断动作"
+        elif isinstance(item, LinkAction):
+            current_source = "链路动作"
+        self._update_runtime_snapshot(
+            state=self.state,
+            current_ts_ns=item.ts_ns,
+            timeline_index=timeline_index,
+            current_item_kind=item.kind,
+            current_source_file=current_source,
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
+
+    def _safe_adapter_health_snapshot(self) -> Dict[str, AdapterHealth]:
+        health_map: Dict[str, AdapterHealth] = {}
+        for adapter_id, adapter in self._adapters.items():
+            try:
+                health = adapter.health()
+            except Exception as exc:  # pragma: no cover - defensive snapshot collection
+                health = AdapterHealth(online=False, detail=f"健康检查失败：{exc}")
+            health_map[adapter_id] = health
+        return health_map
+
+    @staticmethod
+    def _copy_adapter_health_map(health_map: Dict[str, AdapterHealth]) -> Dict[str, AdapterHealth]:
+        return {
+            adapter_id: AdapterHealth(
+                online=health.online,
+                detail=health.detail,
+                per_channel=dict(health.per_channel),
+            )
+            for adapter_id, health in health_map.items()
+        }

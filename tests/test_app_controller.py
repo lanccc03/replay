@@ -7,6 +7,7 @@ from pathlib import Path
 import tests.bootstrap  # noqa: F401
 
 from replay_platform.app_controller import LOG_BUFFER_LIMIT, ReplayApplication
+from replay_platform.core import BusType, DeviceChannelBinding, FrameEnableRule, ReplayLaunchSource, ReplayState, ScenarioSpec
 from replay_platform.ui.main_window import _plan_log_refresh
 
 
@@ -37,6 +38,90 @@ class ReplayApplicationLogTests(unittest.TestCase):
                 [f"log {LOG_BUFFER_LIMIT + 5}", f"log {LOG_BUFFER_LIMIT + 6}"],
                 next_entries[offset:],
             )
+
+    def test_clear_logs_resets_entries_and_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            app.log("log 1")
+            app.log("log 2")
+
+            app.clear_logs()
+            base_index, entries = app.log_snapshot()
+
+            self.assertEqual(0, base_index)
+            self.assertEqual([], entries)
+
+    def test_runtime_snapshot_exposes_launch_source(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-1",
+                name="示例场景",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+
+            app.start_replay(scenario, launch_source=ReplayLaunchSource.SELECTED_FALLBACK)
+            snapshot = app.runtime_snapshot()
+
+            self.assertIn(snapshot.state, {ReplayState.RUNNING, ReplayState.STOPPED})
+            self.assertEqual(ReplayLaunchSource.SELECTED_FALLBACK, snapshot.launch_source)
+
+    def test_start_replay_clears_runtime_frame_enable_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            app.frame_enables.set_rule(FrameEnableRule(logical_channel=0, message_id=0x123, enabled=False))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-1",
+                name="示例场景",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+
+            app.start_replay(scenario)
+
+            self.assertEqual([], app.frame_enables.list_rules())
+
+    def test_stop_replay_clears_runtime_frame_enable_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-1",
+                name="示例场景",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+
+            app.start_replay(scenario)
+            app.frame_enables.set_rule(FrameEnableRule(logical_channel=0, message_id=0x123, enabled=False))
+
+            app.stop_replay()
+
+            self.assertEqual([], app.frame_enables.list_rules())
 
 
 if __name__ == "__main__":

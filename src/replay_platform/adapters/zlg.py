@@ -4,6 +4,7 @@ import importlib.util
 import platform
 from ctypes import addressof, c_char_p, c_void_p, cast, memset, sizeof
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from replay_platform.adapters.base import DeviceAdapter
@@ -127,6 +128,18 @@ class ZlgDeviceAdapter(DeviceAdapter):
             if fd:
                 sent_total += self._send_fd(handle, fd)
         return sent_total
+
+    def send_scheduled(self, batch: Sequence[FrameEvent], enqueue_base_ns: int) -> int:
+        if not batch or any(item.bus_type == BusType.CANFD for item in batch):
+            return self.send(batch)
+        now_ns = time.perf_counter_ns()
+        scheduled_batch = []
+        for item in batch:
+            delay_us = max((enqueue_base_ns + item.ts_ns - now_ns) // 1_000, 0)
+            flags = dict(item.flags)
+            flags["queue_delay_us"] = int(delay_us)
+            scheduled_batch.append(item.clone(flags=flags))
+        return self.send(scheduled_batch)
 
     def read(self, limit: int = 256, timeout_ms: int = 0) -> List[FrameEvent]:
         self.open()
