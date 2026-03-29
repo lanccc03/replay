@@ -6,7 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from replay_platform.app_controller import ReplayApplication
+from replay_platform.app_controller import (
+    DEBUG_LOG_FRAME_SAMPLE_RATE,
+    LOG_LEVEL_PRESET_DEBUG_ALL,
+    LOG_LEVEL_PRESET_DEBUG_SAMPLED,
+    LOG_LEVEL_PRESET_INFO,
+    LOG_LEVEL_PRESET_OPTIONS,
+    LOG_LEVEL_PRESET_WARNING,
+    ReplayApplication,
+)
 from replay_platform.core import (
     BusType,
     DiagnosticTransport,
@@ -29,6 +37,14 @@ BUS_OPTIONS = tuple(item.value for item in BusType)
 TRANSPORT_OPTIONS = tuple(item.value for item in DiagnosticTransport)
 LINK_ACTION_OPTIONS = tuple(item.value for item in LinkActionType)
 FRAME_ENABLE_STATUS_OPTIONS = ("启用", "禁用")
+LOG_LEVEL_OPTION_LABELS = {
+    LOG_LEVEL_PRESET_WARNING: "仅警告",
+    LOG_LEVEL_PRESET_INFO: "信息及以上",
+    LOG_LEVEL_PRESET_DEBUG_SAMPLED: "调试（帧采样）",
+    LOG_LEVEL_PRESET_DEBUG_ALL: "调试（逐帧）",
+}
+LOG_LEVEL_OPTIONS = tuple(LOG_LEVEL_OPTION_LABELS[preset] for preset in LOG_LEVEL_PRESET_OPTIONS)
+LOG_LEVEL_DEFAULT_HINT = "仅影响之后新产生的日志，已有内容不会重新过滤"
 
 
 @dataclass(frozen=True)
@@ -229,6 +245,25 @@ def _plan_log_refresh(cursor: int, base_index: int, entry_count: int) -> tuple[s
         return "reset", 0
     offset = min(max(cursor - base_index, 0), entry_count)
     return "append", offset
+
+
+def _log_level_option(preset: str) -> str:
+    return LOG_LEVEL_OPTION_LABELS[preset]
+
+
+def _parse_log_level_option(option: str) -> str:
+    for preset, label in LOG_LEVEL_OPTION_LABELS.items():
+        if label == option:
+            return preset
+    raise ValueError(f"未知日志级别选项：{option}")
+
+
+def _build_log_level_hint(preset: str) -> str:
+    if preset == LOG_LEVEL_PRESET_DEBUG_SAMPLED:
+        return f"调试模式会按每 {DEBUG_LOG_FRAME_SAMPLE_RATE} 帧采样追加帧明细"
+    if preset == LOG_LEVEL_PRESET_DEBUG_ALL:
+        return "调试模式会逐帧追加帧明细，日志量可能很大"
+    return LOG_LEVEL_DEFAULT_HINT
 
 
 def _normalize_scenario_payload(payload: dict) -> dict:
@@ -2698,6 +2733,15 @@ def build_main_window(app_logic: ReplayApplication):
 
             actions = QHBoxLayout()
             actions.addStretch(1)
+            self.log_level_label = QLabel("日志级别")
+            self.log_level_label.setProperty("role", "muted")
+            actions.addWidget(self.log_level_label)
+
+            self.log_level_combo = QComboBox()
+            self.log_level_combo.addItems(LOG_LEVEL_OPTIONS)
+            self.log_level_combo.setCurrentText(_log_level_option(self.app_logic.current_log_level_preset()))
+            actions.addWidget(self.log_level_combo)
+
             self.auto_scroll_checkbox = QCheckBox("自动滚动")
             self.auto_scroll_checkbox.setChecked(True)
             actions.addWidget(self.auto_scroll_checkbox)
@@ -2707,6 +2751,13 @@ def build_main_window(app_logic: ReplayApplication):
             self._set_button_variant(self.clear_logs_button, "danger")
             actions.addWidget(self.clear_logs_button)
             layout.addLayout(actions)
+
+            self.log_level_hint = QLabel()
+            self.log_level_hint.setProperty("role", "muted")
+            self.log_level_hint.setWordWrap(True)
+            layout.addWidget(self.log_level_hint)
+            self._refresh_log_level_hint()
+            self.log_level_combo.currentTextChanged.connect(self._handle_log_level_changed)
 
             self.log_content_stack = QStackedWidget()
             self.log_empty_state = self._build_empty_state("暂无运行日志，开始回放后会持续刷新")
@@ -3195,6 +3246,17 @@ def build_main_window(app_logic: ReplayApplication):
                 scrollbar = self.log_view.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
 
+        def _handle_log_level_changed(self, option: str) -> None:
+            self.app_logic.apply_log_level_preset(_parse_log_level_option(option))
+            self._refresh_log_level_hint()
+
+        def _refresh_log_level_hint(self) -> None:
+            try:
+                preset = _parse_log_level_option(self.log_level_combo.currentText())
+            except ValueError:
+                preset = self.app_logic.current_log_level_preset()
+            self.log_level_hint.setText(_build_log_level_hint(preset))
+
         def _refresh_overrides(self) -> None:
             selected_keys = {
                 self.override_table.item(index.row(), 0).data(USER_ROLE)
@@ -3492,7 +3554,7 @@ def build_main_window(app_logic: ReplayApplication):
                 logical_channel = self.frame_enable_channel.value()
                 enabled = self.frame_enable_status.currentText().strip() == FRAME_ENABLE_STATUS_OPTIONS[0]
                 self.app_logic.frame_enables.set_enabled(logical_channel, message_id, enabled)
-                self.app_logic.log(
+                self.app_logic.log_info(
                     f"帧使能：LC{logical_channel} ID=0x{message_id:X} 已{_frame_enable_status_text(enabled)}。"
                 )
             except Exception as exc:
@@ -3530,7 +3592,7 @@ def build_main_window(app_logic: ReplayApplication):
                 self.app_logic.frame_enables.clear_rule(*key)
                 cleared += 1
             if cleared:
-                self.app_logic.log(f"帧使能：已恢复 {cleared} 条报文为默认启用。")
+                self.app_logic.log_info(f"帧使能：已恢复 {cleared} 条报文为默认启用。")
             self._refresh_frame_enables()
             self._refresh_logs()
 
@@ -3543,7 +3605,7 @@ def build_main_window(app_logic: ReplayApplication):
             if not rules:
                 return
             self.app_logic.frame_enables.clear_all()
-            self.app_logic.log(f"帧使能：已清空 {len(rules)} 条禁用规则，恢复默认启用。")
+            self.app_logic.log_info(f"帧使能：已清空 {len(rules)} 条禁用规则，恢复默认启用。")
             self._refresh_frame_enables()
             self._refresh_logs()
 

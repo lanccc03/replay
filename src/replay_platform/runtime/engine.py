@@ -39,11 +39,6 @@ FRAME_SLICE_WINDOW_NS = 2_000_000
 FRAME_QUEUE_LOOKAHEAD_NS = 20_000_000
 FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
 SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.J1939})
-LOG_LEVEL_PRIORITY = {
-    ReplayLogLevel.WARNING: 1,
-    ReplayLogLevel.INFO: 2,
-    ReplayLogLevel.DEBUG: 3,
-}
 
 
 @dataclass(frozen=True)
@@ -556,7 +551,7 @@ class ReplayEngine:
                 self._log_warning(f"适配器关闭失败：{exc}")
 
     def _should_emit(self, level: ReplayLogLevel) -> bool:
-        return LOG_LEVEL_PRIORITY[level] <= LOG_LEVEL_PRIORITY[self.log_config.level]
+        return self.log_config.allows(level)
 
     def _log_warning(self, message: str) -> None:
         if self._should_emit(ReplayLogLevel.WARNING):

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from replay_platform.core import BusType, FrameEvent
+from replay_platform.core import BusType, FrameEvent, canfd_payload_length_to_dlc
 from replay_platform.errors import DependencyUnavailableError, TraceFormatError
 
 
@@ -379,18 +379,22 @@ class TraceLoader:
                 if message.is_error_frame:
                     continue
                 bus_type = BusType.CANFD if getattr(message, "is_fd", False) else BusType.CAN
+                payload = bytes(message.data)
                 if message.is_extended_id:
                     raw_id = int(message.arbitration_id) | (1 << 31)
                 else:
                     raw_id = int(message.arbitration_id)
+                dlc = int(message.dlc)
+                if bus_type == BusType.CANFD:
+                    dlc = canfd_payload_length_to_dlc(len(payload))
                 events.append(
                     FrameEvent(
                         ts_ns=int(message.timestamp * 1_000_000_000),
                         bus_type=bus_type,
                         channel=int(getattr(message, "channel", 0) or 0),
                         message_id=raw_id,
-                        payload=bytes(message.data),
-                        dlc=int(message.dlc),
+                        payload=payload,
+                        dlc=dlc,
                         flags={
                             "direction": "Tx" if getattr(message, "is_tx", False) else "Rx",
                             "brs": bool(getattr(message, "bitrate_switch", False)),

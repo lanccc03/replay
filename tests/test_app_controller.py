@@ -6,8 +6,25 @@ from pathlib import Path
 
 import tests.bootstrap  # noqa: F401
 
-from replay_platform.app_controller import LOG_BUFFER_LIMIT, ReplayApplication
-from replay_platform.core import BusType, DeviceChannelBinding, FrameEnableRule, ReplayLaunchSource, ReplayState, ScenarioSpec
+from replay_platform.app_controller import (
+    LOG_BUFFER_LIMIT,
+    LOG_LEVEL_PRESET_DEBUG_ALL,
+    LOG_LEVEL_PRESET_DEBUG_SAMPLED,
+    LOG_LEVEL_PRESET_INFO,
+    LOG_LEVEL_PRESET_WARNING,
+    ReplayApplication,
+)
+from replay_platform.core import (
+    BusType,
+    DeviceChannelBinding,
+    FrameEnableRule,
+    ReplayFrameLogMode,
+    ReplayLaunchSource,
+    ReplayLogConfig,
+    ReplayLogLevel,
+    ReplayState,
+    ScenarioSpec,
+)
 from replay_platform.ui.main_window import _plan_log_refresh
 
 
@@ -50,6 +67,47 @@ class ReplayApplicationLogTests(unittest.TestCase):
 
             self.assertEqual(0, base_index)
             self.assertEqual([], entries)
+
+    def test_apply_log_level_preset_updates_level_and_frame_log_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace), log_config=ReplayLogConfig())
+
+            expected = {
+                LOG_LEVEL_PRESET_WARNING: (ReplayLogLevel.WARNING, ReplayFrameLogMode.OFF, 10),
+                LOG_LEVEL_PRESET_INFO: (ReplayLogLevel.INFO, ReplayFrameLogMode.OFF, 10),
+                LOG_LEVEL_PRESET_DEBUG_SAMPLED: (ReplayLogLevel.DEBUG, ReplayFrameLogMode.SAMPLED, 10),
+                LOG_LEVEL_PRESET_DEBUG_ALL: (ReplayLogLevel.DEBUG, ReplayFrameLogMode.ALL, 10),
+            }
+
+            for preset, (expected_level, expected_frame_mode, expected_sample_rate) in expected.items():
+                with self.subTest(preset=preset):
+                    app.apply_log_level_preset(preset)
+                    self.assertEqual(expected_level, app.log_config.level)
+                    self.assertEqual(expected_frame_mode, app.log_config.frame_mode)
+                    self.assertEqual(expected_sample_rate, app.log_config.frame_sample_rate)
+                    self.assertEqual(expected_level, app.engine.log_config.level)
+                    self.assertEqual(expected_frame_mode, app.engine.log_config.frame_mode)
+                    self.assertEqual(expected_sample_rate, app.engine.log_config.frame_sample_rate)
+
+    def test_current_log_level_preset_reflects_debug_frame_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace), log_config=ReplayLogConfig(level=ReplayLogLevel.DEBUG))
+
+            app.log_config.frame_mode = ReplayFrameLogMode.ALL
+            self.assertEqual(LOG_LEVEL_PRESET_DEBUG_ALL, app.current_log_level_preset())
+
+            app.log_config.frame_mode = ReplayFrameLogMode.SAMPLED
+            self.assertEqual(LOG_LEVEL_PRESET_DEBUG_SAMPLED, app.current_log_level_preset())
+
+    def test_level_aware_app_logs_respect_warning_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace), log_config=ReplayLogConfig(level=ReplayLogLevel.WARNING))
+
+            app.log_info("info log")
+            app.log_warning("warning log")
+
+            _, entries = app.log_snapshot()
+            self.assertEqual(["warning log"], entries)
 
     def test_runtime_snapshot_exposes_launch_source(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

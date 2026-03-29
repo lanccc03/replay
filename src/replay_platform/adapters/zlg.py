@@ -17,6 +17,7 @@ from replay_platform.core import (
     DeviceChannelBinding,
     DeviceDescriptor,
     FrameEvent,
+    canfd_payload_length_to_dlc,
 )
 from replay_platform.errors import AdapterOperationError, ConfigurationError
 
@@ -301,7 +302,8 @@ class ZlgDeviceAdapter(DeviceAdapter):
             messages[index].transmit_type = 0
             messages[index].frame.can_id = self._raw_can_id(event)
             payload = event.payload[:64]
-            messages[index].frame.len = min(event.dlc, len(payload), 64)
+            # ZLG 的 CANFD len 字段使用 DLC 码值，不是原始字节数。
+            messages[index].frame.len = canfd_payload_length_to_dlc(len(payload))
             if event.flags.get("tx_echo"):
                 messages[index].frame.flags |= 0x20
             if event.flags.get("brs"):

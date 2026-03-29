@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
-from replay_platform.core import FrameEvent, SignalOverride
+from replay_platform.core import BusType, FrameEvent, SignalOverride, canfd_payload_length_to_dlc
 from replay_platform.errors import DependencyUnavailableError
 
 
@@ -203,7 +203,10 @@ class SignalOverrideService:
         if not changes:
             return event
         payload = codec.encode(event.message_id, changes, event.payload)
-        return event.clone(payload=payload, dlc=len(payload))
+        dlc = len(payload)
+        if event.bus_type == BusType.CANFD:
+            dlc = canfd_payload_length_to_dlc(len(payload))
+        return event.clone(payload=payload, dlc=dlc)
 
 
 def _normalize(value: str) -> str:

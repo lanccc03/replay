@@ -139,6 +139,40 @@ class SignalOverrideTests(unittest.TestCase):
         patched = service.apply(event)
         self.assertEqual(10, patched.payload[0])
 
+    def test_apply_canfd_override_preserves_wire_dlc(self):
+        service = SignalOverrideService()
+        codec = StaticMessageCodec(
+            {
+                0x13B: StaticMessageDefinition(
+                    name="VehicleState",
+                    signal_bytes={"vehicle_speed": 0},
+                )
+            }
+        )
+        service.bind_codec(0, codec)
+        service.set_override(
+            SignalOverride(
+                logical_channel=0,
+                message_id_or_pgn=0x13B,
+                signal_name="vehicle_speed",
+                value=0x55,
+            )
+        )
+        event = FrameEvent(
+            ts_ns=0,
+            bus_type=BusType.CANFD,
+            channel=0,
+            message_id=0x13B,
+            payload=bytes.fromhex("79E000E000B633CE2F0021150000280E"),
+            dlc=0xA,
+        )
+
+        patched = service.apply(event)
+
+        self.assertEqual(0x55, patched.payload[0])
+        self.assertEqual(16, len(patched.payload))
+        self.assertEqual(0xA, patched.dlc)
+
 
 if __name__ == "__main__":
     unittest.main()

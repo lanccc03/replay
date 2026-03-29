@@ -6,6 +6,7 @@ import tests.bootstrap  # noqa: F401
 
 from replay_platform.ui.main_window import (
     _assess_scenario_launch,
+    _build_log_level_hint,
     _binding_summary,
     _frame_enable_rule_summary,
     _build_scenario_delete_summary,
@@ -25,10 +26,13 @@ from replay_platform.ui.main_window import (
     _parse_scalar_text,
     _playback_button_state,
     _plan_log_refresh,
+    _log_level_option,
+    _parse_log_level_option,
     _scenario_payload_is_dirty,
     _should_reset_current_scenario_after_delete,
     _validate_binding_draft,
 )
+from replay_platform.app_controller import LOG_LEVEL_PRESET_DEBUG_ALL, LOG_LEVEL_PRESET_DEBUG_SAMPLED
 from replay_platform.core import (
     AdapterHealth,
     FrameEnableRule,
@@ -102,6 +106,16 @@ class MainWindowHelperTests(unittest.TestCase):
 
     def test_plan_log_refresh_appends_from_cursor_offset(self) -> None:
         self.assertEqual(("append", 3), _plan_log_refresh(8, 5, 10))
+
+    def test_log_level_options_distinguish_sampled_and_all_debug(self) -> None:
+        self.assertEqual("调试（帧采样）", _log_level_option(LOG_LEVEL_PRESET_DEBUG_SAMPLED))
+        self.assertEqual("调试（逐帧）", _log_level_option(LOG_LEVEL_PRESET_DEBUG_ALL))
+        self.assertEqual(LOG_LEVEL_PRESET_DEBUG_SAMPLED, _parse_log_level_option("调试（帧采样）"))
+        self.assertEqual(LOG_LEVEL_PRESET_DEBUG_ALL, _parse_log_level_option("调试（逐帧）"))
+
+    def test_log_level_hint_describes_sampled_and_all_debug(self) -> None:
+        self.assertIn("采样", _build_log_level_hint(LOG_LEVEL_PRESET_DEBUG_SAMPLED))
+        self.assertIn("逐帧", _build_log_level_hint(LOG_LEVEL_PRESET_DEBUG_ALL))
 
     def test_validate_binding_draft_reports_required_bool_and_json_errors(self) -> None:
         binding_payload = {

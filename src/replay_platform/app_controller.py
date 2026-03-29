@@ -11,8 +11,10 @@ from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.adapters.zlg import ZlgDeviceAdapter
 from replay_platform.core import (
     DiagnosticTransport,
+    ReplayFrameLogMode,
     ReplayLaunchSource,
     ReplayLogConfig,
+    ReplayLogLevel,
     ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
@@ -28,6 +30,27 @@ from replay_platform.services.trace_loader import TraceLoader
 
 
 LOG_BUFFER_LIMIT = 2000
+DEBUG_LOG_FRAME_SAMPLE_RATE = 10
+LOG_LEVEL_PRESET_WARNING = "warning"
+LOG_LEVEL_PRESET_INFO = "info"
+LOG_LEVEL_PRESET_DEBUG_SAMPLED = "debug_sampled"
+LOG_LEVEL_PRESET_DEBUG_ALL = "debug_all"
+LOG_LEVEL_PRESET_OPTIONS = (
+    LOG_LEVEL_PRESET_WARNING,
+    LOG_LEVEL_PRESET_INFO,
+    LOG_LEVEL_PRESET_DEBUG_SAMPLED,
+    LOG_LEVEL_PRESET_DEBUG_ALL,
+)
+LOG_LEVEL_PRESET_CONFIGS = {
+    LOG_LEVEL_PRESET_WARNING: (ReplayLogLevel.WARNING, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
+    LOG_LEVEL_PRESET_INFO: (ReplayLogLevel.INFO, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
+    LOG_LEVEL_PRESET_DEBUG_SAMPLED: (
+        ReplayLogLevel.DEBUG,
+        ReplayFrameLogMode.SAMPLED,
+        DEBUG_LOG_FRAME_SAMPLE_RATE,
+    ),
+    LOG_LEVEL_PRESET_DEBUG_ALL: (ReplayLogLevel.DEBUG, ReplayFrameLogMode.ALL, DEBUG_LOG_FRAME_SAMPLE_RATE),
+}
 
 
 class ReplayApplication:
@@ -50,12 +73,65 @@ class ReplayApplication:
         self._last_runtime_state = ReplayState.STOPPED
 
     def log(self, message: str) -> None:
+        self._append_log(message)
+
+    def _append_log(self, message: str) -> None:
         with self._log_lock:
             self._logs.append(message)
             overflow = len(self._logs) - LOG_BUFFER_LIMIT
             if overflow > 0:
                 del self._logs[:overflow]
                 self._log_base_index += overflow
+
+    def log_warning(self, message: str) -> None:
+        if self.log_config.allows(ReplayLogLevel.WARNING):
+            self._append_log(message)
+
+    def log_info(self, message: str) -> None:
+        if self.log_config.allows(ReplayLogLevel.INFO):
+            self._append_log(message)
+
+    def log_debug(self, message: str) -> None:
+        if self.log_config.allows(ReplayLogLevel.DEBUG):
+            self._append_log(message)
+
+    def current_log_level_preset(self) -> str:
+        level = self.log_config.level if isinstance(self.log_config.level, ReplayLogLevel) else ReplayLogLevel(self.log_config.level)
+        frame_mode = (
+            self.log_config.frame_mode
+            if isinstance(self.log_config.frame_mode, ReplayFrameLogMode)
+            else ReplayFrameLogMode(self.log_config.frame_mode)
+        )
+        if level == ReplayLogLevel.WARNING:
+            return LOG_LEVEL_PRESET_WARNING
+        if level == ReplayLogLevel.INFO:
+            return LOG_LEVEL_PRESET_INFO
+        if frame_mode == ReplayFrameLogMode.ALL:
+            return LOG_LEVEL_PRESET_DEBUG_ALL
+        return LOG_LEVEL_PRESET_DEBUG_SAMPLED
+
+    def apply_log_level_preset(self, preset: ReplayLogLevel | str) -> None:
+        normalized_preset = self._normalize_log_level_preset(preset)
+        preset_level, frame_mode, sample_rate = LOG_LEVEL_PRESET_CONFIGS[normalized_preset]
+        self.log_config.level = preset_level
+        self.log_config.frame_mode = frame_mode
+        self.log_config.frame_sample_rate = sample_rate
+        if self.engine.log_config is not self.log_config:
+            self.engine.log_config.level = preset_level
+            self.engine.log_config.frame_mode = frame_mode
+            self.engine.log_config.frame_sample_rate = sample_rate
+
+    def _normalize_log_level_preset(self, preset: ReplayLogLevel | str) -> str:
+        if isinstance(preset, ReplayLogLevel):
+            if preset == ReplayLogLevel.WARNING:
+                return LOG_LEVEL_PRESET_WARNING
+            if preset == ReplayLogLevel.INFO:
+                return LOG_LEVEL_PRESET_INFO
+            return LOG_LEVEL_PRESET_DEBUG_SAMPLED
+        if preset in LOG_LEVEL_PRESET_CONFIGS:
+            return preset
+        normalized_level = ReplayLogLevel(preset)
+        return self._normalize_log_level_preset(normalized_level)
 
     @property
     def log_limit(self) -> int:

@@ -13,6 +13,38 @@ class BusType(str, Enum):
     ETH = "ETH"
 
 
+CANFD_PAYLOAD_LENGTHS_BY_DLC = {
+    0x0: 0,
+    0x1: 1,
+    0x2: 2,
+    0x3: 3,
+    0x4: 4,
+    0x5: 5,
+    0x6: 6,
+    0x7: 7,
+    0x8: 8,
+    0x9: 12,
+    0xA: 16,
+    0xB: 20,
+    0xC: 24,
+    0xD: 32,
+    0xE: 48,
+    0xF: 64,
+}
+
+
+def canfd_payload_length_to_dlc(payload_length: int) -> int:
+    length = int(payload_length)
+    if length < 0:
+        raise ValueError("CANFD payload length 不能为负数。")
+    if length <= 8:
+        return length
+    for dlc, allowed_length in CANFD_PAYLOAD_LENGTHS_BY_DLC.items():
+        if allowed_length >= length:
+            return dlc
+    raise ValueError(f"CANFD payload length 超出上限：{length}")
+
+
 class ReplayState(str, Enum):
     STOPPED = "STOPPED"
     RUNNING = "RUNNING"
@@ -28,6 +60,13 @@ class ReplayLogLevel(str, Enum):
     WARNING = "warning"
     INFO = "info"
     DEBUG = "debug"
+
+
+LOG_LEVEL_PRIORITY = {
+    ReplayLogLevel.WARNING: 1,
+    ReplayLogLevel.INFO: 2,
+    ReplayLogLevel.DEBUG: 3,
+}
 
 
 class ReplayFrameLogMode(str, Enum):
@@ -113,6 +152,11 @@ class ReplayLogConfig:
         if not isinstance(self.frame_mode, ReplayFrameLogMode):
             self.frame_mode = ReplayFrameLogMode(self.frame_mode)
         self.frame_sample_rate = max(int(self.frame_sample_rate), 1)
+
+    def allows(self, level: ReplayLogLevel | str) -> bool:
+        current_level = self.level if isinstance(self.level, ReplayLogLevel) else ReplayLogLevel(self.level)
+        target_level = level if isinstance(level, ReplayLogLevel) else ReplayLogLevel(level)
+        return LOG_LEVEL_PRIORITY[target_level] <= LOG_LEVEL_PRIORITY[current_level]
 
 
 @dataclass
