@@ -85,6 +85,21 @@ class SlowDiagnosticClient(DiagnosticClient):
 
 
 class ReplayEngineTests(unittest.TestCase):
+    def _wait_for(
+        self,
+        predicate,
+        *,
+        timeout_s: float = 0.3,
+        interval_s: float = 0.005,
+        failure_message: str = "条件在预期时间内未满足。",
+    ) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(interval_s)
+        self.fail(failure_message)
+
     def _run_engine_to_completion(
         self,
         scenario: ScenarioSpec,
@@ -157,6 +172,8 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(ReplayState.STOPPED, snapshot.state)
         self.assertEqual(0, snapshot.timeline_size)
         self.assertEqual("", snapshot.current_source_file)
+        self.assertFalse(snapshot.loop_enabled)
+        self.assertEqual(0, snapshot.completed_loops)
 
     def test_snapshot_reports_running_progress_and_source_file(self):
         adapter = MockDeviceAdapter("mock-1", channel_count=1)
@@ -204,6 +221,8 @@ class ReplayEngineTests(unittest.TestCase):
             self.assertEqual("body.asc", snapshot.current_source_file)
             self.assertIn("mock-1", snapshot.adapter_health)
             self.assertEqual(ReplayLaunchSource.SCENARIO_BOUND, snapshot.launch_source)
+            self.assertFalse(snapshot.loop_enabled)
+            self.assertEqual(0, snapshot.completed_loops)
         finally:
             engine.stop()
 
@@ -256,6 +275,174 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(ReplayState.STOPPED, completed_snapshot.state)
         self.assertEqual(1, completed_snapshot.timeline_index)
         self.assertEqual("done.asc", completed_snapshot.current_source_file)
+        self.assertFalse(completed_snapshot.loop_enabled)
+        self.assertEqual(0, completed_snapshot.completed_loops)
+
+    def test_loop_playback_restarts_timeline_and_accumulates_stats(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-loop-basic",
+            name="Loop basic",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=0,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x120,
+                payload=b"\x01",
+                dlc=1,
+            )
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {}, loop_enabled=True)
+        engine.start()
+        try:
+            self._wait_for(
+                lambda: engine.snapshot().completed_loops >= 1 and engine.stats.sent_frames >= 2,
+                timeout_s=0.2,
+                failure_message="循环回放未按预期进入下一圈。",
+            )
+            snapshot = engine.snapshot()
+            self.assertEqual(ReplayState.RUNNING, snapshot.state)
+            self.assertTrue(snapshot.loop_enabled)
+            self.assertGreaterEqual(snapshot.completed_loops, 1)
+            self.assertGreaterEqual(engine.stats.sent_frames, 2)
+        finally:
+            engine.stop()
+
+    def test_loop_playback_reinitializes_channels_after_link_disconnect(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-loop-link-reset",
+            name="Loop link reset",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+            link_actions=[
+                LinkAction(
+                    ts_ns=5_000_000,
+                    adapter_id="mock-1",
+                    action=LinkActionType.DISCONNECT,
+                    logical_channel=0,
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=0,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x121,
+                payload=b"\x01",
+                dlc=1,
+            )
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {}, loop_enabled=True)
+        engine.start()
+        try:
+            self._wait_for(
+                lambda: engine.snapshot().completed_loops >= 1 and adapter.open_count >= 2 and engine.stats.sent_frames >= 2,
+                timeout_s=0.25,
+                failure_message="循环回放未在下一圈重新初始化通道。",
+            )
+            self.assertGreaterEqual(adapter.open_count, 2)
+            self.assertEqual({0}, set(adapter.health().per_channel))
+        finally:
+            engine.stop()
+
+    def test_runtime_frame_enable_rules_persist_across_loop_boundaries(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        frame_enables = FrameEnableService()
+        scenario = ScenarioSpec(
+            scenario_id="s-loop-frame-enable",
+            name="Loop frame enable",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+            link_actions=[
+                LinkAction(
+                    ts_ns=50_000_000,
+                    adapter_id="mock-1",
+                    action=LinkActionType.RECONNECT,
+                    logical_channel=0,
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=0,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x122,
+                payload=b"\x01",
+                dlc=1,
+            )
+        ]
+        engine = ReplayEngine(
+            signal_overrides=SignalOverrideService(),
+            frame_enables=frame_enables,
+        )
+        engine.configure(scenario, frames, {"mock-1": adapter}, {}, loop_enabled=True)
+        engine.start()
+        try:
+            self._wait_for(
+                lambda: engine.stats.sent_frames >= 1,
+                timeout_s=0.1,
+                failure_message="首圈回放帧未发送。",
+            )
+            frame_enables.set_rule(FrameEnableRule(logical_channel=0, message_id=0x122, enabled=False))
+            self._wait_for(
+                lambda: engine.snapshot().completed_loops >= 1 and engine.stats.skipped_frames >= 1,
+                timeout_s=0.2,
+                failure_message="跨圈后未保留运行时帧禁用规则。",
+            )
+            self.assertEqual(1, engine.stats.sent_frames)
+            self.assertGreaterEqual(engine.stats.skipped_frames, 1)
+        finally:
+            engine.stop()
+
+    def test_loop_enabled_with_empty_timeline_stops_without_spinning(self):
+        scenario = ScenarioSpec(scenario_id="s-loop-empty", name="Loop empty")
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, [], {}, {}, loop_enabled=True)
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.1,
+            failure_message="空时间轴在循环模式下未按预期停止。",
+        )
+
+        snapshot = engine.snapshot()
+        self.assertEqual(ReplayState.STOPPED, snapshot.state)
+        self.assertTrue(snapshot.loop_enabled)
+        self.assertEqual(0, snapshot.completed_loops)
 
     def test_conflicting_bindings_on_same_physical_channel_raise(self):
         adapter = MockDeviceAdapter("mock-1", channel_count=2)
@@ -1053,6 +1240,58 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(2, len(adapter.sent_frames))
         self.assertGreaterEqual(adapter.reconnect_count, 1)
         self.assertEqual(ReplayState.STOPPED, engine.state)
+
+    def test_pause_resume_and_stop_keep_working_in_loop_mode(self):
+        adapter = MockDeviceAdapter("mock-1")
+        scenario = ScenarioSpec(
+            scenario_id="s-loop-pause-resume",
+            name="Loop pause resume",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=0,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x123,
+                payload=b"\x01\x02\x03\x04\x05\x06\x07\x08",
+                dlc=8,
+            ),
+            FrameEvent(
+                ts_ns=120_000_000,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x124,
+                payload=b"\x10\x11\x12\x13\x14\x15\x16\x17",
+                dlc=8,
+            ),
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {}, loop_enabled=True)
+        engine.start()
+        time.sleep(0.02)
+        engine.pause()
+        sent_while_paused = len(adapter.sent_frames)
+        time.sleep(0.08)
+        self.assertEqual(sent_while_paused, len(adapter.sent_frames))
+        engine.resume()
+        self._wait_for(
+            lambda: len(adapter.sent_frames) >= 2,
+            timeout_s=0.25,
+            failure_message="循环模式下恢复后未继续发送后续帧。",
+        )
+        engine.stop()
+        self.assertEqual(ReplayState.STOPPED, engine.state)
+        self.assertGreaterEqual(len(adapter.sent_frames), 2)
 
     def test_reenabled_frame_id_only_affects_future_frames(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)

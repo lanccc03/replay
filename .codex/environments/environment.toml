@@ -9,6 +9,7 @@ script = ""
 name = "运行"
 icon = "run"
 command = '''
-source /Users/lanyy/Code/replay/.venv/bin/activate.fish
+& c:\code\replay\.venv\Scripts\Activate.ps1
 replay-platform
 '''
+platform = "win32"

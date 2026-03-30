@@ -190,6 +190,7 @@ class ReplayApplication:
         scenario: ScenarioSpec,
         *,
         launch_source: ReplayLaunchSource = ReplayLaunchSource.SCENARIO_BOUND,
+        loop_enabled: bool = False,
     ) -> None:
         self.frame_enables.clear_all()
         frames = []
@@ -206,7 +207,14 @@ class ReplayApplication:
             self.signal_overrides.set_override(override)
         adapters = self._build_adapters(scenario)
         diagnostics = self._build_diagnostics(scenario, adapters)
-        self.engine.configure(scenario, frames, adapters, diagnostics, launch_source=launch_source)
+        self.engine.configure(
+            scenario,
+            frames,
+            adapters,
+            diagnostics,
+            launch_source=launch_source,
+            loop_enabled=loop_enabled,
+        )
         self.engine.start()
         self._last_runtime_state = self.engine.state
 

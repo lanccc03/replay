@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ctypes import Structure, c_ubyte, c_uint
+from types import SimpleNamespace
 import unittest
 
 import tests.bootstrap  # noqa: F401
@@ -30,6 +31,7 @@ class _FakeTransmitFdData(Structure):
 
 class _FakeSdkModule:
     ZCAN_TransmitFD_Data = _FakeTransmitFdData
+    ZCAN_DT_ZCAN_CAN_CANFD_DATA = 1
 
 
 class _FakeZcan:
@@ -49,7 +51,7 @@ class _FakeZcan:
 
 
 class ZlgAdapterTests(unittest.TestCase):
-    def test_send_fd_uses_payload_length_to_encode_dlc(self):
+    def _make_adapter(self) -> ZlgDeviceAdapter:
         adapter = ZlgDeviceAdapter(
             "zlg0",
             DeviceChannelBinding(
@@ -62,7 +64,25 @@ class ZlgAdapterTests(unittest.TestCase):
             ),
         )
         adapter._sdk_module = _FakeSdkModule()
+        return adapter
+
+    def _make_fd_frame(self, message_id: int, payload: bytes, *, flags: int = 0) -> _FakeCanFdFrame:
+        frame = _FakeCanFdFrame()
+        frame.can_id = message_id
+        frame.len = len(payload)
+        frame.flags = flags
+        for index, value in enumerate(payload):
+            frame.data[index] = value
+        return frame
+
+    def test_send_fd_uses_actual_payload_length(self):
+        adapter = self._make_adapter()
         adapter._zcan = _FakeZcan()
+        payloads = [
+            bytes.fromhex("79E000E000B633CE2F0021150000280E"),
+            bytes(range(24)),
+            bytes(range(64)),
+        ]
 
         sent = adapter._send_fd(
             handle=object(),
@@ -72,17 +92,88 @@ class ZlgAdapterTests(unittest.TestCase):
                     bus_type=BusType.CANFD,
                     channel=0,
                     message_id=0x13B,
-                    payload=bytes.fromhex("79E000E000B633CE2F0021150000280E"),
-                    dlc=16,
+                    payload=payloads[0],
+                    dlc=0xA,
                     flags={"brs": True},
-                )
+                ),
+                FrameEvent(
+                    ts_ns=0,
+                    bus_type=BusType.CANFD,
+                    channel=0,
+                    message_id=0x146,
+                    payload=payloads[1],
+                    dlc=0xC,
+                ),
+                FrameEvent(
+                    ts_ns=0,
+                    bus_type=BusType.CANFD,
+                    channel=0,
+                    message_id=0x12E,
+                    payload=payloads[2],
+                    dlc=0xF,
+                ),
             ],
         )
 
-        self.assertEqual(1, sent)
-        self.assertEqual(0xA, adapter._zcan.last_batch[0][0])
-        self.assertEqual(bytes.fromhex("79E000E000B633CE2F0021150000280E"), adapter._zcan.last_batch[0][1][:16])
+        self.assertEqual(3, sent)
+        self.assertEqual([16, 24, 64], [item[0] for item in adapter._zcan.last_batch])
+        self.assertEqual(payloads[0], adapter._zcan.last_batch[0][1][:16])
+        self.assertEqual(payloads[1], adapter._zcan.last_batch[1][1][:24])
+        self.assertEqual(payloads[2], adapter._zcan.last_batch[2][1][:64])
         self.assertTrue(adapter._zcan.last_batch[0][2] & 0x01)
+
+    def test_convert_fd_maps_payload_length_back_to_canfd_dlc(self):
+        adapter = self._make_adapter()
+        payloads = [
+            bytes(range(16)),
+            bytes(range(24)),
+            bytes(range(64)),
+        ]
+
+        events = adapter._convert_fd(
+            physical_channel=0,
+            messages=[
+                SimpleNamespace(frame=self._make_fd_frame(0x44D, payloads[0], flags=0x21), timestamp=123),
+                SimpleNamespace(frame=self._make_fd_frame(0x146, payloads[1], flags=0x01), timestamp=456),
+                SimpleNamespace(frame=self._make_fd_frame(0x12E, payloads[2]), timestamp=789),
+            ],
+        )
+
+        self.assertEqual([0xA, 0xC, 0xF], [event.dlc for event in events])
+        self.assertEqual([16, 24, 64], [len(event.payload) for event in events])
+        self.assertEqual("Tx", events[0].flags["direction"])
+        self.assertEqual("Rx", events[1].flags["direction"])
+        self.assertTrue(events[0].flags["brs"])
+        self.assertTrue(events[1].flags["brs"])
+        self.assertFalse(events[2].flags["brs"])
+
+    def test_convert_merge_maps_canfd_payload_length_back_to_dlc(self):
+        adapter = self._make_adapter()
+        payload = bytes(range(64))
+        frame = self._make_fd_frame(0x12E, payload, flags=0x01)
+
+        events = adapter._convert_merge(
+            [
+                SimpleNamespace(
+                    dataType=_FakeSdkModule.ZCAN_DT_ZCAN_CAN_CANFD_DATA,
+                    chnl=1,
+                    data=SimpleNamespace(
+                        zcanfddata=SimpleNamespace(
+                            timestamp=321,
+                            flag=SimpleNamespace(frameType=1, txEchoed=0),
+                            frame=frame,
+                        )
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(1, len(events))
+        self.assertEqual(BusType.CANFD, events[0].bus_type)
+        self.assertEqual(0xF, events[0].dlc)
+        self.assertEqual(payload, events[0].payload)
+        self.assertEqual("Rx", events[0].flags["direction"])
+        self.assertTrue(events[0].flags["brs"])
 
 
 if __name__ == "__main__":

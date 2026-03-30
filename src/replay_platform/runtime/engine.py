@@ -78,6 +78,8 @@ class ReplayEngine:
         self._base_perf_ns = 0
         self._pause_started_ns = 0
         self._timeline_index = 0
+        self._loop_enabled = False
+        self._completed_loops = 0
         self._stats_lock = threading.Lock()
         self._snapshot_lock = threading.Lock()
         self._frame_log_counts: Dict[str, int] = {}
@@ -91,12 +93,15 @@ class ReplayEngine:
         diagnostics: Optional[Dict[str, DiagnosticClient]] = None,
         *,
         launch_source: Optional[ReplayLaunchSource] = None,
+        loop_enabled: bool = False,
     ) -> None:
         self._scenario = scenario
         self._timeline = scenario.timeline_items(frames)
         self._adapters = adapters
         self._diagnostics = diagnostics or {}
         self._timeline_index = 0
+        self._loop_enabled = bool(loop_enabled)
+        self._completed_loops = 0
         self.stats = ReplayStats()
         self._frame_log_counts.clear()
         with self._diagnostic_condition:
@@ -110,6 +115,8 @@ class ReplayEngine:
             timeline_size=len(self._timeline),
             adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
             launch_source=launch_source,
+            loop_enabled=self._loop_enabled,
+            completed_loops=self._completed_loops,
         )
 
     def start(self) -> None:
@@ -192,6 +199,8 @@ class ReplayEngine:
                 current_source_file=snapshot.current_source_file,
                 adapter_health=self._copy_adapter_health_map(snapshot.adapter_health),
                 launch_source=snapshot.launch_source,
+                loop_enabled=snapshot.loop_enabled,
+                completed_loops=snapshot.completed_loops,
             )
 
     def seek_to_start(self) -> None:
@@ -248,19 +257,9 @@ class ReplayEngine:
                     self._condition.wait(timeout=0.1)
                     continue
             if self._timeline_index >= len(self._timeline):
-                self._wait_for_diagnostics_idle()
-                if self._stop_requested:
+                if not self._handle_timeline_exhausted():
                     return
-                self.state = ReplayState.STOPPED
-                self._teardown_adapters()
-                self._update_runtime_snapshot(
-                    state=self.state,
-                    current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
-                    timeline_index=len(self._timeline),
-                    adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
-                )
-                self._log_info("回放已完成。")
-                return
+                continue
             frame_batch = self._frame_batch_at(self._timeline_index)
             item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
             advance_count = len(frame_batch) if frame_batch else 1
@@ -289,6 +288,58 @@ class ReplayEngine:
                 self._log_warning(f"回放异常：{exc}")
             finally:
                 self._timeline_index += advance_count
+
+    def _handle_timeline_exhausted(self) -> bool:
+        self._wait_for_diagnostics_idle()
+        if self._stop_requested:
+            return False
+        if not self._loop_enabled or not self._timeline:
+            self._stop_diagnostic_worker()
+            self.state = ReplayState.STOPPED
+            self._teardown_adapters()
+            self._update_runtime_snapshot(
+                state=self.state,
+                current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
+                timeline_index=len(self._timeline),
+                adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            )
+            self._log_info("回放已完成。")
+            return False
+        try:
+            self._restart_loop_playback()
+        except Exception as exc:  # pragma: no cover - defensive runtime logging
+            self._record_error(str(exc))
+            self._log_warning(f"循环回放重启失败：{exc}")
+            self._stop_diagnostic_worker()
+            self.state = ReplayState.STOPPED
+            self._teardown_adapters()
+            self._update_runtime_snapshot(
+                state=self.state,
+                current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
+                timeline_index=len(self._timeline),
+                adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            )
+            self._log_info("回放已停止。")
+            return False
+        return True
+
+    def _restart_loop_playback(self) -> None:
+        self._completed_loops += 1
+        self._teardown_adapters()
+        self._prepare_channels()
+        self._timeline_index = 0
+        self._base_perf_ns = time.perf_counter_ns()
+        self._frame_log_counts.clear()
+        self._update_runtime_snapshot(
+            state=self.state,
+            current_ts_ns=0,
+            timeline_index=0,
+            current_item_kind=None,
+            current_source_file="",
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            completed_loops=self._completed_loops,
+        )
+        self._log_info(f"循环回放：进入第 {self._completed_loops + 1} 圈。")
 
     def _sleep_until(self, target_ns: int) -> None:
         while True:

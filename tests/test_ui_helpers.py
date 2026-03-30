@@ -7,6 +7,7 @@ import tests.bootstrap  # noqa: F401
 from replay_platform.ui.main_window import (
     _assess_scenario_launch,
     _build_log_level_hint,
+    _format_replay_stats,
     _binding_summary,
     _frame_enable_rule_summary,
     _build_scenario_delete_summary,
@@ -36,6 +37,7 @@ from replay_platform.app_controller import LOG_LEVEL_PRESET_DEBUG_ALL, LOG_LEVEL
 from replay_platform.core import (
     AdapterHealth,
     FrameEnableRule,
+    ReplayStats,
     ReplayLaunchSource,
     ReplayRuntimeSnapshot,
     ReplayState,
@@ -180,6 +182,33 @@ class MainWindowHelperTests(unittest.TestCase):
         rule = FrameEnableRule(logical_channel=1, message_id=0x123, enabled=False)
 
         self.assertEqual("LC1 | 0x123 | 禁用", _frame_enable_rule_summary(rule))
+
+    def test_format_replay_stats_includes_loop_progress_when_enabled(self) -> None:
+        stats = ReplayStats(sent_frames=12, skipped_frames=2, diagnostic_actions=1, link_actions=3)
+        snapshot = ReplayRuntimeSnapshot(
+            state=ReplayState.RUNNING,
+            loop_enabled=True,
+            completed_loops=2,
+        )
+
+        summary = _format_replay_stats(stats, snapshot)
+
+        self.assertIn("循环回放：当前第 3 圈 / 已完成 2 圈", summary)
+        self.assertIn("已发帧 12", summary)
+        self.assertIn("错误 0", summary)
+
+    def test_format_replay_stats_reports_completed_loops_after_stop(self) -> None:
+        stats = ReplayStats(sent_frames=4, skipped_frames=1)
+        snapshot = ReplayRuntimeSnapshot(
+            state=ReplayState.STOPPED,
+            loop_enabled=True,
+            completed_loops=1,
+        )
+
+        summary = _format_replay_stats(stats, snapshot)
+
+        self.assertIn("循环回放：已完成 1 圈", summary)
+        self.assertNotIn("当前第", summary)
 
     def test_assess_scenario_launch_prefers_bound_trace_files(self) -> None:
         payload = {

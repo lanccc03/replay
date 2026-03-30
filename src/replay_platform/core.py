@@ -330,6 +330,8 @@ class ReplayRuntimeSnapshot:
     current_source_file: str = ""
     adapter_health: Dict[str, AdapterHealth] = field(default_factory=dict)
     launch_source: Optional[ReplayLaunchSource] = None
+    loop_enabled: bool = False
+    completed_loops: int = 0
 
 
 @dataclass

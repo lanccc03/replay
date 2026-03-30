@@ -302,8 +302,8 @@ class ZlgDeviceAdapter(DeviceAdapter):
             messages[index].transmit_type = 0
             messages[index].frame.can_id = self._raw_can_id(event)
             payload = event.payload[:64]
-            # ZLG 的 CANFD len 字段使用 DLC 码值，不是原始字节数。
-            messages[index].frame.len = canfd_payload_length_to_dlc(len(payload))
+            # ZLG 的 CANFD len 字段使用真实字节数；内部 FrameEvent.dlc 仍保留 DLC 码值。
+            messages[index].frame.len = len(payload)
             if event.flags.get("tx_echo"):
                 messages[index].frame.flags |= 0x20
             if event.flags.get("brs"):
@@ -332,19 +332,12 @@ class ZlgDeviceAdapter(DeviceAdapter):
     def _convert_fd(self, physical_channel: int, messages: Sequence[Any]) -> List[FrameEvent]:
         items: List[FrameEvent] = []
         for message in messages:
-            payload = bytes(message.frame.data[: message.frame.len])
             items.append(
-                FrameEvent(
-                    ts_ns=int(message.timestamp) * 1000,
-                    bus_type=BusType.CANFD,
-                    channel=physical_channel,
-                    message_id=int(message.frame.can_id),
-                    payload=payload,
-                    dlc=int(message.frame.len),
-                    flags={
-                        "direction": "Tx" if message.frame.flags & 0x20 else "Rx",
-                        "brs": bool(message.frame.flags & 0x01),
-                    },
+                self._convert_canfd_frame(
+                    physical_channel,
+                    message.frame,
+                    int(message.timestamp),
+                    direction="Tx" if message.frame.flags & 0x20 else "Rx",
                 )
             )
         return items
@@ -355,22 +348,56 @@ class ZlgDeviceAdapter(DeviceAdapter):
             if message.dataType != self._sdk_module.ZCAN_DT_ZCAN_CAN_CANFD_DATA:
                 continue
             frame = message.data.zcanfddata.frame
+            direction = "Tx" if message.data.zcanfddata.flag.txEchoed else "Rx"
+            if message.data.zcanfddata.flag.frameType:
+                items.append(
+                    self._convert_canfd_frame(
+                        int(message.chnl),
+                        frame,
+                        int(message.data.zcanfddata.timestamp),
+                        direction=direction,
+                    )
+                )
+                continue
             payload = bytes(frame.data[: frame.len])
             items.append(
                 FrameEvent(
                     ts_ns=int(message.data.zcanfddata.timestamp) * 1000,
-                    bus_type=BusType.CANFD if message.data.zcanfddata.flag.frameType else BusType.CAN,
+                    bus_type=BusType.CAN,
                     channel=int(message.chnl),
                     message_id=int(frame.can_id),
                     payload=payload,
                     dlc=int(frame.len),
                     flags={
-                        "direction": "Tx" if message.data.zcanfddata.flag.txEchoed else "Rx",
+                        "direction": direction,
                         "brs": bool(frame.flags & 0x01),
                     },
                 )
             )
         return items
+
+    def _convert_canfd_frame(
+        self,
+        physical_channel: int,
+        frame: Any,
+        timestamp_us: int,
+        *,
+        direction: str,
+    ) -> FrameEvent:
+        payload_length = int(frame.len)
+        payload = bytes(frame.data[:payload_length])
+        return FrameEvent(
+            ts_ns=int(timestamp_us) * 1000,
+            bus_type=BusType.CANFD,
+            channel=physical_channel,
+            message_id=int(frame.can_id),
+            payload=payload,
+            dlc=canfd_payload_length_to_dlc(payload_length),
+            flags={
+                "direction": direction,
+                "brs": bool(frame.flags & 0x01),
+            },
+        )
 
     @staticmethod
     def _raw_can_id(event: FrameEvent) -> int:

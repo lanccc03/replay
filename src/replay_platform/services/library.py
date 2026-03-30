@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import shutil
 import sqlite3
@@ -7,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from replay_platform.core import ScenarioSpec, TraceFileRecord
 from replay_platform.paths import AppPaths
@@ -34,8 +35,17 @@ class FileLibraryService:
         self.paths.ensure()
         self._initialize_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.paths.sqlite_path)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.paths.sqlite_path)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize_schema(self) -> None:
         with self._connect() as connection:

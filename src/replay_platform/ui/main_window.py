@@ -372,10 +372,17 @@ def _playback_button_state(state: ReplayState | str, ready: bool) -> PlaybackBut
     return PlaybackButtonState(False, False, False, False)
 
 
-def _format_replay_stats(stats: ReplayStats) -> str:
+def _format_replay_stats(stats: ReplayStats, snapshot: ReplayRuntimeSnapshot) -> str:
+    loop_text = ""
+    if snapshot.loop_enabled:
+        if snapshot.state in {ReplayState.RUNNING, ReplayState.PAUSED}:
+            loop_text = f"循环回放：当前第 {snapshot.completed_loops + 1} 圈 / 已完成 {snapshot.completed_loops} 圈 | "
+        else:
+            loop_text = f"循环回放：已完成 {snapshot.completed_loops} 圈 | "
     return (
-        "已发帧 {sent} | 跳过帧 {skipped} | 诊断动作 {diagnostic} | 链路动作 {links} | 错误 {errors}"
+        "{loop}已发帧 {sent} | 跳过帧 {skipped} | 诊断动作 {diagnostic} | 链路动作 {links} | 错误 {errors}"
     ).format(
+        loop=loop_text,
         sent=stats.sent_frames,
         skipped=stats.skipped_frames,
         diagnostic=stats.diagnostic_actions,
@@ -889,6 +896,7 @@ def build_main_window(app_logic: ReplayApplication):
         QScrollArea,
         QSpinBox,
         QStackedWidget,
+        QStyleFactory,
         QSplitter,
         QTabWidget,
         QTableWidget,
@@ -1282,6 +1290,7 @@ def build_main_window(app_logic: ReplayApplication):
             self.scenario_trace_list = QListWidget()
             self.scenario_trace_list.setSelectionMode(QAbstractItemView.NoSelection)
             self.scenario_trace_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._apply_checkable_list_style_compatibility(self.scenario_trace_list)
             self.scenario_trace_list.itemChanged.connect(self._handle_user_edit)
             layout.addWidget(self.scenario_trace_list)
             parent_layout.addWidget(box)
@@ -1553,6 +1562,16 @@ def build_main_window(app_logic: ReplayApplication):
         def _register_section(self, key: str, box: QGroupBox, title: str) -> None:
             self._section_boxes[key] = box
             self._section_titles[key] = title
+
+        def _apply_checkable_list_style_compatibility(self, widget: QListWidget) -> None:
+            current_style = widget.style()
+            style_name = current_style.objectName().strip().lower() if current_style is not None else ""
+            if not style_name.startswith("windows"):
+                return
+            # Windows 原生 style 与当前 QSS 叠加时会让 checkable QListWidget 的勾选框几乎不可见。
+            fusion_style = QStyleFactory.create("Fusion")
+            if fusion_style is not None:
+                widget.setStyle(fusion_style)
 
         def _make_field_container(
             self,
@@ -2453,6 +2472,10 @@ def build_main_window(app_logic: ReplayApplication):
             controls_buttons.addWidget(self.stop_button)
             controls_layout.addLayout(controls_buttons)
 
+            self.loop_playback_checkbox = QCheckBox("循环回放")
+            self.loop_playback_checkbox.setChecked(False)
+            controls_layout.addWidget(self.loop_playback_checkbox)
+
             self.stats_label = QLabel()
             self.stats_label.setProperty("role", "muted")
             controls_layout.addWidget(self.stats_label)
@@ -3149,6 +3172,7 @@ def build_main_window(app_logic: ReplayApplication):
             self.pause_button.setEnabled(buttons.pause_enabled)
             self.resume_button.setEnabled(buttons.resume_enabled)
             self.stop_button.setEnabled(buttons.stop_enabled)
+            self.loop_playback_checkbox.setEnabled(snapshot.state == ReplayState.STOPPED)
 
             if snapshot.state == ReplayState.RUNNING:
                 self._set_badge(self.runtime_badge, "运行中", "info")
@@ -3159,7 +3183,7 @@ def build_main_window(app_logic: ReplayApplication):
             else:
                 self._set_badge(self.runtime_badge, "已停止", "muted")
                 self.status_label.setText("运行状态：已停止。")
-            self.stats_label.setText(_format_replay_stats(self.app_logic.engine.stats))
+            self.stats_label.setText(_format_replay_stats(self.app_logic.engine.stats, snapshot))
 
             summary = _build_runtime_visibility_summary(
                 snapshot,
@@ -3501,7 +3525,11 @@ def build_main_window(app_logic: ReplayApplication):
         def _start_replay(self) -> None:
             try:
                 scenario, launch_source = self._scenario_from_current_source(use_selected_trace_fallback=True)
-                self.app_logic.start_replay(scenario, launch_source=launch_source)
+                self.app_logic.start_replay(
+                    scenario,
+                    launch_source=launch_source,
+                    loop_enabled=self.loop_playback_checkbox.isChecked(),
+                )
             except Exception as exc:
                 QMessageBox.critical(self, "回放失败", str(exc))
                 return

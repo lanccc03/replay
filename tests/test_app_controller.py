@@ -132,6 +132,33 @@ class ReplayApplicationLogTests(unittest.TestCase):
 
             self.assertIn(snapshot.state, {ReplayState.RUNNING, ReplayState.STOPPED})
             self.assertEqual(ReplayLaunchSource.SELECTED_FALLBACK, snapshot.launch_source)
+            self.assertFalse(snapshot.loop_enabled)
+            self.assertEqual(0, snapshot.completed_loops)
+
+    def test_runtime_snapshot_exposes_loop_state(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-1",
+                name="示例场景",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+
+            app.start_replay(scenario, loop_enabled=True)
+            snapshot = app.runtime_snapshot()
+
+            self.assertIn(snapshot.state, {ReplayState.RUNNING, ReplayState.STOPPED})
+            self.assertTrue(snapshot.loop_enabled)
+            self.assertEqual(0, snapshot.completed_loops)
 
     def test_start_replay_clears_runtime_frame_enable_rules(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
