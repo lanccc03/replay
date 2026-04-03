@@ -49,6 +49,13 @@ class RecordingMockDeviceAdapter(MockDeviceAdapter):
         return super().send_scheduled(batch, enqueue_base_ns)
 
 
+class NoCanFdQueueRecordingMockDeviceAdapter(RecordingMockDeviceAdapter):
+    def capabilities(self):
+        capabilities = super().capabilities()
+        capabilities.queue_send_canfd = False
+        return capabilities
+
+
 class PartialSendMockDeviceAdapter(RecordingMockDeviceAdapter):
     def __init__(self, adapter_id: str = "mock", channel_count: int = 4, sent_count: int = 0) -> None:
         super().__init__(adapter_id, channel_count=channel_count)
@@ -1108,11 +1115,37 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertGreaterEqual(adapter.reconnect_count, 1)
         self.assertEqual(1, engine.stats.link_actions)
 
-    def test_canfd_batch_falls_back_to_immediate_send(self):
+    def test_future_canfd_batch_uses_scheduled_send(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
         scenario = ScenarioSpec(
-            scenario_id="s-scheduled-canfd-fallback",
-            name="Scheduled fallback",
+            scenario_id="s-scheduled-canfd-send",
+            name="Scheduled CANFD send",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CANFD,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CANFD, channel=0, message_id=0x101, payload=b"\x02\x03", dlc=2),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CANFD, channel=0, message_id=0x102, payload=b"\x04\x05", dlc=2),
+        ]
+        self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+        self.assertEqual(1, len(adapter.scheduled_batches))
+        self.assertEqual([0x101, 0x102], [frame.message_id for frame in adapter.scheduled_batches[0]])
+        self.assertGreaterEqual(adapter.scheduled_call_offsets_ns[0], 18_000_000)
+        self.assertEqual(1, len(adapter.send_batches))
+
+    def test_single_canfd_frame_falls_back_to_immediate_send(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-single-canfd-fallback",
+            name="Single CANFD fallback",
             bindings=[
                 DeviceChannelBinding(
                     adapter_id="mock-1",
@@ -1130,6 +1163,76 @@ class ReplayEngineTests(unittest.TestCase):
         self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
         self.assertEqual([], adapter.scheduled_batches)
         self.assertEqual(1, len(adapter.send_batches))
+
+    def test_mixed_can_and_canfd_batch_uses_scheduled_send_when_supported(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=2)
+        scenario = ScenarioSpec(
+            scenario_id="s-scheduled-mixed-send",
+            name="Scheduled mixed send",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                ),
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=1,
+                    physical_channel=1,
+                    bus_type=BusType.CANFD,
+                    device_type="MOCK",
+                ),
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CANFD, channel=1, message_id=0x101, payload=b"\x02\x03", dlc=2),
+        ]
+
+        self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+
+        self.assertEqual(1, len(adapter.scheduled_batches))
+        self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.scheduled_batches[0]])
+        self.assertEqual(1, len(adapter.send_batches))
+
+    def test_mixed_can_and_canfd_batch_falls_back_without_canfd_queue_support(self):
+        adapter = NoCanFdQueueRecordingMockDeviceAdapter("mock-1", channel_count=2)
+        scenario = ScenarioSpec(
+            scenario_id="s-scheduled-mixed-fallback",
+            name="Scheduled mixed fallback",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                ),
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=1,
+                    physical_channel=1,
+                    bus_type=BusType.CANFD,
+                    device_type="MOCK",
+                ),
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CANFD, channel=1, message_id=0x101, payload=b"\x02\x03", dlc=2),
+        ]
+
+        self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+
+        self.assertEqual([], adapter.scheduled_batches)
+        self.assertEqual(1, len(adapter.send_batches))
+        self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.send_batches[0]])
 
     def test_slow_diagnostic_does_not_block_following_frames(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)

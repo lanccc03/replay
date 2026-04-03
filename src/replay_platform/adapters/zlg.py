@@ -107,11 +107,14 @@ class ZlgDeviceAdapter(DeviceAdapter):
             raise AdapterOperationError(f"通道 {physical_channel} StartCAN 失败。")
         self._channel_handles[physical_channel] = handle
         self._channel_configs[physical_channel] = config
+        self._try_clear_delay_send_queue(physical_channel)
+        self._try_enable_delay_send_queue(physical_channel)
 
     def stop_channel(self, physical_channel: int) -> None:
         handle = self._channel_handles.pop(physical_channel, None)
         self._channel_configs.pop(physical_channel, None)
         if handle is not None and self._zcan is not None:
+            self._try_clear_delay_send_queue(physical_channel)
             self._zcan.ResetCAN(handle)
 
     def send(self, batch: Sequence[FrameEvent]) -> int:
@@ -131,12 +134,13 @@ class ZlgDeviceAdapter(DeviceAdapter):
         return sent_total
 
     def send_scheduled(self, batch: Sequence[FrameEvent], enqueue_base_ns: int) -> int:
-        if not batch or any(item.bus_type == BusType.CANFD for item in batch):
+        if not batch:
             return self.send(batch)
         now_ns = time.perf_counter_ns()
         scheduled_batch = []
         for item in batch:
-            delay_us = max((enqueue_base_ns + item.ts_ns - now_ns) // 1_000, 0)
+            remaining_ns = enqueue_base_ns + item.ts_ns - now_ns
+            delay_us = max((remaining_ns + 999) // 1_000, 0)
             flags = dict(item.flags)
             flags["queue_delay_us"] = int(delay_us)
             scheduled_batch.append(item.clone(flags=flags))
@@ -198,6 +202,7 @@ class ZlgDeviceAdapter(DeviceAdapter):
             j1939=True,
             merge_receive=True,
             queue_send=True,
+            queue_send_canfd=True,
             tx_timestamp=True,
             bus_usage=True,
             can_uds=True,
@@ -273,6 +278,18 @@ class ZlgDeviceAdapter(DeviceAdapter):
         if strict and result != self._sdk_module.ZCAN_STATUS_OK:
             raise AdapterOperationError(f"ZCAN_SetValue 设置失败：{path} -> {value}")
 
+    def _try_set_string_value(self, path: str, value: Any) -> None:
+        try:
+            self._set_string_value(path, value, strict=False)
+        except Exception:
+            return
+
+    def _try_enable_delay_send_queue(self, physical_channel: int) -> None:
+        self._try_set_string_value(f"{physical_channel}/set_send_mode", 1)
+
+    def _try_clear_delay_send_queue(self, physical_channel: int) -> None:
+        self._try_set_string_value(f"{physical_channel}/clear_delay_send_queue", 0)
+
     def _send_classic(self, handle: Any, events: Sequence[FrameEvent]) -> int:
         messages = (self._sdk_module.ZCAN_Transmit_Data * len(events))()
         memset(addressof(messages), 0, sizeof(messages))
@@ -283,14 +300,10 @@ class ZlgDeviceAdapter(DeviceAdapter):
             messages[index].frame.can_dlc = min(event.dlc, len(payload), 8)
             if event.flags.get("tx_echo"):
                 messages[index].frame._pad |= 0x20
-            delay_us = event.flags.get("queue_delay_us")
-            if delay_us:
-                messages[index].frame._pad |= 1 << 7
-                if delay_us % 100:
-                    messages[index].frame._pad |= 1 << 6
-                delay_ticks = int(delay_us / (100 if delay_us % 100 else 1000))
-                messages[index].frame._res0 = delay_ticks & 0xFF
-                messages[index].frame._res1 = (delay_ticks >> 8) & 0xFF
+            delay_flags, delay_res0, delay_res1 = self._encode_queue_delay_fields(event.flags.get("queue_delay_us"))
+            messages[index].frame._pad |= delay_flags
+            messages[index].frame._res0 = delay_res0
+            messages[index].frame._res1 = delay_res1
             for payload_index, value in enumerate(payload[:8]):
                 messages[index].frame.data[payload_index] = value
         return int(self._zcan.Transmit(handle, messages, len(events)) or 0)
@@ -308,9 +321,29 @@ class ZlgDeviceAdapter(DeviceAdapter):
                 messages[index].frame.flags |= 0x20
             if event.flags.get("brs"):
                 messages[index].frame.flags |= 0x01
+            delay_flags, delay_res0, delay_res1 = self._encode_queue_delay_fields(event.flags.get("queue_delay_us"))
+            messages[index].frame.flags |= delay_flags
+            messages[index].frame._res0 = delay_res0
+            messages[index].frame._res1 = delay_res1
             for payload_index, value in enumerate(payload[:64]):
                 messages[index].frame.data[payload_index] = value
         return int(self._zcan.TransmitFD(handle, messages, len(events)) or 0)
+
+    @staticmethod
+    def _encode_queue_delay_fields(delay_us: Any) -> tuple[int, int, int]:
+        if delay_us is None:
+            return 0, 0, 0
+        normalized_delay_us = max(int(delay_us), 0)
+        if normalized_delay_us <= 0:
+            return 0, 0, 0
+        if normalized_delay_us % 1_000 == 0:
+            delay_ticks = normalized_delay_us // 1_000
+            delay_flags = 1 << 7
+        else:
+            delay_ticks = (normalized_delay_us + 99) // 100
+            delay_flags = (1 << 7) | (1 << 6)
+        delay_ticks = min(delay_ticks, 0xFFFF)
+        return delay_flags, delay_ticks & 0xFF, (delay_ticks >> 8) & 0xFF
 
     def _convert_can(self, physical_channel: int, messages: Sequence[Any]) -> List[FrameEvent]:
         items: List[FrameEvent] = []

@@ -909,7 +909,7 @@
 				</meta>
 			</get_device_recv_merge>
 			<set_device_tx_echo flag="0x0122">
-				<value>0</value>
+				<value>1</value>
 				<meta>
 					<visible>false</visible>
 					<type>uint32</type>

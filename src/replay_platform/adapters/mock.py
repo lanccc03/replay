@@ -89,6 +89,7 @@ class MockDeviceAdapter(DeviceAdapter):
             j1939=True,
             merge_receive=True,
             queue_send=True,
+            queue_send_canfd=True,
             tx_timestamp=True,
             bus_usage=True,
             can_uds=True,

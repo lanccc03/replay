@@ -38,7 +38,7 @@ from replay_platform.services.signal_catalog import SignalOverrideService
 FRAME_SLICE_WINDOW_NS = 2_000_000
 FRAME_SCHEDULE_WINDOW_NS = FRAME_SLICE_WINDOW_NS
 FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
-SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.J1939})
+SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
 
 
 @dataclass(frozen=True)
@@ -398,22 +398,37 @@ class ReplayEngine:
             return False
         if latest_target_ns <= now_ns or latest_target_ns - now_ns > FRAME_SCHEDULE_WINDOW_NS:
             return False
-        checked_adapters: set[str] = set()
+        checked_adapter_buses: set[tuple[str, BusType]] = set()
         for frame in enabled_frames:
             if frame.bus_type not in SCHEDULED_FRAME_BUS_TYPES:
                 return False
             binding = self._binding_for(frame.channel)
             if binding is None:
                 raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
-            if binding.adapter_id in checked_adapters:
+            capability_bus = self._scheduled_capability_bus(frame.bus_type)
+            checked_key = (binding.adapter_id, capability_bus)
+            if checked_key in checked_adapter_buses:
                 continue
             adapter = self._adapters.get(binding.adapter_id)
             if adapter is None:
                 raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
-            if not adapter.capabilities().queue_send:
+            if not self._adapter_supports_scheduled_bus(adapter, frame.bus_type):
                 return False
-            checked_adapters.add(binding.adapter_id)
+            checked_adapter_buses.add(checked_key)
         return True
+
+    @staticmethod
+    def _scheduled_capability_bus(bus_type: BusType) -> BusType:
+        if bus_type == BusType.CANFD:
+            return BusType.CANFD
+        return BusType.CAN
+
+    @classmethod
+    def _adapter_supports_scheduled_bus(cls, adapter: DeviceAdapter, bus_type: BusType) -> bool:
+        capabilities = adapter.capabilities()
+        if cls._scheduled_capability_bus(bus_type) == BusType.CANFD:
+            return capabilities.queue_send_canfd
+        return capabilities.queue_send
 
     def _dispatch_frame_batch(self, frames: Sequence[FrameEvent], scheduled: bool = False) -> None:
         self._send_prepared_frames(self._prepare_frame_groups(frames), scheduled=scheduled)

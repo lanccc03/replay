@@ -3,6 +3,7 @@ from __future__ import annotations
 from ctypes import Structure, c_ubyte, c_uint
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import tests.bootstrap  # noqa: F401
 
@@ -36,7 +37,7 @@ class _FakeSdkModule:
 
 class _FakeZcan:
     def __init__(self) -> None:
-        self.last_batch: list[tuple[int, bytes, int]] = []
+        self.last_batch: list[tuple[int, bytes, int, int, int]] = []
 
     def TransmitFD(self, _handle, messages, count):
         self.last_batch = [
@@ -44,6 +45,8 @@ class _FakeZcan:
                 int(messages[index].frame.len),
                 bytes(messages[index].frame.data[:64]),
                 int(messages[index].frame.flags),
+                int(messages[index].frame._res0),
+                int(messages[index].frame._res1),
             )
             for index in range(count)
         ]
@@ -121,6 +124,45 @@ class ZlgAdapterTests(unittest.TestCase):
         self.assertEqual(payloads[1], adapter._zcan.last_batch[1][1][:24])
         self.assertEqual(payloads[2], adapter._zcan.last_batch[2][1][:64])
         self.assertTrue(adapter._zcan.last_batch[0][2] & 0x01)
+
+    def test_send_scheduled_fd_encodes_queue_delay_without_losing_brs_or_length(self):
+        adapter = self._make_adapter()
+        adapter._zcan = _FakeZcan()
+        adapter._channel_handles[0] = object()
+        frames = [
+            FrameEvent(
+                ts_ns=450_000,
+                bus_type=BusType.CANFD,
+                channel=0,
+                message_id=0x13B,
+                payload=bytes(range(16)),
+                dlc=0xA,
+                flags={"brs": True},
+            ),
+            FrameEvent(
+                ts_ns=2_000_000,
+                bus_type=BusType.CANFD,
+                channel=0,
+                message_id=0x146,
+                payload=bytes(range(24)),
+                dlc=0xC,
+            ),
+        ]
+
+        with patch("replay_platform.adapters.zlg.time.perf_counter_ns", return_value=1_000_000_000):
+            sent = adapter.send_scheduled(frames, 1_000_000_000)
+
+        self.assertEqual(2, sent)
+        self.assertEqual(16, adapter._zcan.last_batch[0][0])
+        self.assertEqual(bytes(range(16)), adapter._zcan.last_batch[0][1][:16])
+        self.assertEqual(0xC1, adapter._zcan.last_batch[0][2])
+        self.assertEqual(5, adapter._zcan.last_batch[0][3])
+        self.assertEqual(0, adapter._zcan.last_batch[0][4])
+        self.assertEqual(24, adapter._zcan.last_batch[1][0])
+        self.assertEqual(bytes(range(24)), adapter._zcan.last_batch[1][1][:24])
+        self.assertEqual(0x80, adapter._zcan.last_batch[1][2])
+        self.assertEqual(2, adapter._zcan.last_batch[1][3])
+        self.assertEqual(0, adapter._zcan.last_batch[1][4])
 
     def test_convert_fd_maps_payload_length_back_to_canfd_dlc(self):
         adapter = self._make_adapter()

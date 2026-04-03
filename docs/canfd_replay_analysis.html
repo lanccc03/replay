@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CAN FD 回放逻辑解析</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --paper: #fffdf8;
+      --ink: #1f2933;
+      --muted: #5b6773;
+      --line: #ddd2c2;
+      --accent: #0f6c5c;
+      --accent-soft: #e2f1ed;
+      --warn: #a14d1a;
+      --warn-soft: #fff0e4;
+      --shadow: 0 18px 40px rgba(48, 42, 35, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(15, 108, 92, 0.10), transparent 26%),
+        radial-gradient(circle at left 20%, rgba(161, 77, 26, 0.08), transparent 24%),
+        linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%);
+      line-height: 1.65;
+    }
+
+    .page {
+      width: min(1160px, calc(100vw - 32px));
+      margin: 28px auto 40px;
+    }
+
+    .hero {
+      background: linear-gradient(135deg, rgba(15, 108, 92, 0.96), rgba(11, 72, 61, 0.92));
+      color: #f7fbfa;
+      border-radius: 24px;
+      padding: 32px 34px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -60px -70px auto;
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .hero h1 {
+      margin: 0 0 10px;
+      font-size: 34px;
+      line-height: 1.15;
+      letter-spacing: 0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 880px;
+      color: rgba(247, 251, 250, 0.92);
+      font-size: 15px;
+    }
+
+    .meta {
+      margin-top: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      color: #f7fbfa;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .card {
+      grid-column: span 12;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 24px 24px 22px;
+      box-shadow: var(--shadow);
+    }
+
+    .card.half {
+      grid-column: span 6;
+    }
+
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+    }
+
+    .card h3 {
+      margin: 22px 0 10px;
+      font-size: 17px;
+    }
+
+    .card p,
+    .card li {
+      font-size: 14px;
+      color: var(--ink);
+    }
+
+    .lead {
+      font-size: 15px;
+      color: var(--muted);
+    }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .fact {
+      background: #fbf8f2;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 14px 12px;
+    }
+
+    .fact strong {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .fact span {
+      font-size: 19px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .summary-list,
+    .plain-list {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .summary-list li + li,
+    .plain-list li + li {
+      margin-top: 10px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .step {
+      position: relative;
+      background: linear-gradient(180deg, #fcfaf5 0%, #f4eee4 100%);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px 14px 12px;
+      min-height: 150px;
+    }
+
+    .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--accent);
+      font-size: 22px;
+      font-weight: 700;
+      z-index: 2;
+    }
+
+    .step .num {
+      display: inline-flex;
+      width: 28px;
+      height: 28px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }
+
+    .step p {
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .timeline {
+      position: relative;
+      margin-top: 18px;
+      padding-left: 22px;
+      border-left: 3px solid #d8c9b5;
+    }
+
+    .timeline-item {
+      position: relative;
+      padding: 0 0 18px 12px;
+    }
+
+    .timeline-item::before {
+      content: "";
+      position: absolute;
+      left: -31px;
+      top: 6px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 5px rgba(15, 108, 92, 0.10);
+    }
+
+    .timeline-item h3 {
+      margin-top: 0;
+    }
+
+    .code-ref {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 4px 8px;
+      border-radius: 10px;
+      background: #f2ede4;
+      color: #4f5d6b;
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 12px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+      padding: 11px 10px;
+    }
+
+    th {
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: #faf5ec;
+    }
+
+    code {
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 0.92em;
+      background: #f4efe7;
+      padding: 1px 5px;
+      border-radius: 6px;
+    }
+
+    .note {
+      border-radius: 16px;
+      padding: 16px 16px 14px;
+      border: 1px solid #c7dfd9;
+      background: #eef7f4;
+      margin-top: 14px;
+    }
+
+    .warn {
+      border-color: #efc7a7;
+      background: var(--warn-soft);
+    }
+
+    .note strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--accent);
+    }
+
+    .warn strong {
+      color: var(--warn);
+    }
+
+    .footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 960px) {
+      .card.half {
+        grid-column: span 12;
+      }
+
+      .facts {
+        grid-template-columns: 1fr;
+      }
+
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .step:not(:last-child)::after {
+        content: "↓";
+        left: 50%;
+        right: auto;
+        top: auto;
+        bottom: -16px;
+        transform: translateX(-50%);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>当前 CAN FD 回放逻辑解析</h1>
+      <p>本页只聚焦“回放”链路，基于 2026 年 4 月 3 日仓库当前代码进行静态分析。从主窗口点击“开始回放”开始，沿着场景选择、trace 装载、统一时间轴调度、信号覆盖、帧批处理，到 ZLG 设备上的 CAN FD 发送路径，梳理真实执行流程和关键分支。</p>
+      <div class="meta">
+        <span class="chip">范围：回放，不含录制</span>
+        <span class="chip">重点：CAN FD 实际发送链路</span>
+        <span class="chip">验证方式：源码阅读 + 现有测试对照</span>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>先看结论</h2>
+        <p class="lead">当前实现里，CAN FD 回放和 CAN/J1939 共用同一个统一时间轴，但在“批次是否交给设备定时队列”这一步明显分叉。</p>
+        <ul class="summary-list">
+          <li>回放入口在主窗口 <code>_start_replay()</code>，它先决定文件来源，再把场景交给 <code>ReplayApplication.start_replay()</code> 组装。<span class="code-ref">src/replay_platform/ui/main_window.py:3510 / 3525</span></li>
+          <li><code>ReplayApplication.start_replay()</code> 会加载 trace、按 <code>ts_ns</code> 排序、加载数据库、注入初始信号覆盖、创建适配器，然后把所有内容交给 <code>ReplayEngine</code>。<span class="code-ref">src/replay_platform/app_controller.py:188-218</span></li>
+          <li><code>ReplayEngine</code> 以 <code>ScenarioSpec.timeline_items()</code> 构造统一时间轴，把帧事件、链路动作、诊断动作混排。<span class="code-ref">src/replay_platform/core.py:352-364</span></li>
+          <li>帧批处理窗口固定为 2 ms。一个窗口内连续的帧会先聚成批，再决定是“立即发”还是“设备定时发”。<span class="code-ref">src/replay_platform/runtime/engine.py:38-41 / 367-386</span></li>
+          <li>设备定时发送只允许 <code>CAN</code> 和 <code>J1939</code>；<code>CANFD</code> 明确被排除，所以 CAN FD 批次会直接走即时发送。<span class="code-ref">src/replay_platform/runtime/engine.py:41 / 386-416</span></li>
+          <li>ZLG 的 CAN FD 发送不是把 DLC 码值写进设备，而是把真实 payload 字节数写入 <code>frame.len</code>；BRS 会写回，ESI 不会。<span class="code-ref">src/replay_platform/adapters/zlg.py:298-311</span></li>
+        </ul>
+        <div class="facts">
+          <div class="fact">
+            <strong>时间基准</strong>
+            <span>perf_counter_ns</span>
+          </div>
+          <div class="fact">
+            <strong>批处理窗口</strong>
+            <span>2 ms</span>
+          </div>
+          <div class="fact">
+            <strong>CAN FD 定时队列</strong>
+            <span>当前不启用</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>总流程图</h2>
+        <div class="flow">
+          <div class="step">
+            <div class="num">1</div>
+            <strong>UI 决定启动来源</strong>
+            <p>优先使用场景绑定的 <code>trace_file_ids</code>；若为空且主窗口选中了 trace，则回退到“当前选中文件”。</p>
+          </div>
+          <div class="step">
+            <div class="num">2</div>
+            <strong>应用层装载数据</strong>
+            <p>读取 trace 缓存，转成 <code>FrameEvent</code>，并装载数据库绑定、初始信号覆盖、适配器和诊断对象。</p>
+          </div>
+          <div class="step">
+            <div class="num">3</div>
+            <strong>引擎构造统一时间轴</strong>
+            <p>把帧、链路动作、诊断动作统一按 <code>ts_ns</code> 排序，形成单一调度序列。</p>
+          </div>
+          <div class="step">
+            <div class="num">4</div>
+            <strong>启动设备通道</strong>
+            <p>按绑定配置打开适配器、启动物理通道；CAN FD 通道会下发名义波特率和数据相位波特率。</p>
+          </div>
+          <div class="step">
+            <div class="num">5</div>
+            <strong>2ms 分片调度</strong>
+            <p>连续帧先做 2 ms 切片，再过滤帧使能、应用信号覆盖、逻辑通道映射到物理通道。</p>
+          </div>
+          <div class="step">
+            <div class="num">6</div>
+            <strong>ZLG 发出 CAN FD</strong>
+            <p>按物理通道分组进入 <code>TransmitFD</code>；真实 payload 长度写入设备帧长度，BRS 由 flags 控制。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="card half">
+        <h2>源码主入口</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>位置</th>
+              <th>职责</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>src/replay_platform/ui/main_window.py:3510-3548</code></td>
+              <td>从当前场景或主窗口选中文件组装启动输入，触发开始 / 暂停 / 继续 / 停止回放。</td>
+            </tr>
+            <tr>
+              <td><code>src/replay_platform/app_controller.py:188-218</code></td>
+              <td>装载 trace、数据库、覆盖项、适配器与诊断对象，并调用引擎 <code>configure/start</code>。</td>
+            </tr>
+            <tr>
+              <td><code>src/replay_platform/runtime/engine.py:88-489</code></td>
+              <td>统一时间轴、运行状态机、2ms 帧分片、调度判断、发送、链路动作和循环回放。</td>
+            </tr>
+            <tr>
+              <td><code>src/replay_platform/adapters/zlg.py:89-311</code></td>
+              <td>启动 ZLG CAN/CAN FD 通道，并把内部 <code>FrameEvent</code> 变成 SDK 发送结构。</td>
+            </tr>
+            <tr>
+              <td><code>src/replay_platform/services/trace_loader.py:269-389</code></td>
+              <td>把 ASC/BLF 中的 CAN FD 帧解析成内部标准化事件。</td>
+            </tr>
+            <tr>
+              <td><code>src/replay_platform/services/signal_catalog.py:192-208</code></td>
+              <td>发送前按 DBC 重新编码 payload，并在 CAN FD 下重新计算 DLC 码值。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card half">
+        <h2>当前实现最关键的 4 个判断点</h2>
+        <ol class="plain-list">
+          <li>启动时文件来源是否来自场景，还是来自 UI 回退选择。</li>
+          <li>2 ms 切片内是否有至少 2 条“仍然启用”的帧。</li>
+          <li>该批次是否全部属于 <code>CAN/J1939</code> 且适配器支持 <code>queue_send</code>。</li>
+          <li>链路动作是否插入在帧之间，导致批次被打断，或者因为重连耗时让后续帧变成“已过期后立即发送”。</li>
+        </ol>
+        <div class="note">
+          <strong>对 CAN FD 的直接含义</strong>
+          当前代码里，只要批次里存在 CAN FD 帧，就不会走引擎的“设备定时队列”分支；这意味着引擎不会为 CAN FD 显式保留 slice 内的微小时隙。
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>详细流程拆解</h2>
+        <div class="timeline">
+          <div class="timeline-item">
+            <h3>1. 主窗口决定“这次回放到底放哪些文件”</h3>
+            <p>主窗口的 <code>_scenario_from_current_source()</code> 会先取当前场景；如果场景本身没有 <code>trace_file_ids</code>，而主窗口左侧列表选中了 trace，则把这些 trace 临时注入到 payload 中，并把启动来源标成 <code>SELECTED_FALLBACK</code>。随后 <code>_start_replay()</code> 把这个场景连同“循环回放”开关一起交给应用层。</p>
+            <span class="code-ref">src/replay_platform/ui/main_window.py:3510-3538</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>2. 应用层把 trace 变成运行期帧列表</h3>
+            <p><code>ReplayApplication.start_replay()</code> 会遍历 <code>scenario.trace_file_ids</code>，通过文件库读取缓存后的 trace 事件，并把 <code>source_file</code> 改成原始文件路径或文件名。随后所有帧按 <code>ts_ns</code> 再排一次序，保证多文件合并后仍是统一时间轴。</p>
+            <span class="code-ref">src/replay_platform/app_controller.py:188-203</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>3. 启动前先把“发送前改包”能力装进来</h3>
+            <p>数据库绑定会先调用 <code>load_database()</code>，随后场景自带的 <code>signal_overrides</code> 逐条注入。真正发帧前，引擎会在 <code>_prepare_frame_groups()</code> 里调用 <code>signal_overrides.apply()</code>，因此覆盖发生在“逻辑通道帧”转成“物理通道帧”之前。</p>
+            <span class="code-ref">src/replay_platform/app_controller.py:204-207</span>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:428-446</span>
+            <span class="code-ref">src/replay_platform/services/signal_catalog.py:192-208</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>4. 引擎把帧、链路动作、诊断动作合成一条时间轴</h3>
+            <p><code>ScenarioSpec.timeline_items()</code> 直接把三类对象放进一个列表，再按 <code>ts_ns</code> 排序。这意味着回放调度看到的是“统一时间轴”，而不是“帧一条线、链路动作一条线”。所以链路动作能在时间轴中间打断一个帧批次。</p>
+            <span class="code-ref">src/replay_platform/core.py:352-364</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>5. 引擎启动时建立逻辑时间基准并打开物理通道</h3>
+            <p><code>ReplayEngine.start()</code> 会先 <code>_prepare_channels()</code>，再以当前 <code>time.perf_counter_ns()</code> 建立 <code>_base_perf_ns</code>。对于 ZLG，若通道绑定类型是 CAN FD，则 <code>start_channel()</code> 会把通道初始化为 <code>ZCAN_TYPE_CANFD</code>，并下发 <code>canfd_abit_baud_rate</code> 和 <code>canfd_dbit_baud_rate</code>。</p>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:122-138</span>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:205-230</span>
+            <span class="code-ref">src/replay_platform/adapters/zlg.py:89-105 / 258-263</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>6. 运行循环按“当前索引 + 2ms 分片”拿出待发帧</h3>
+            <p><code>_run_loop()</code> 每次先看当前位置是不是帧；如果是帧，则调用 <code>_frame_batch_at()</code>，把从当前帧开始、到 <code>2 ms</code> 窗口结束前的连续帧打成一个批次。只要中间插入了诊断动作或链路动作，批次就会被截断。</p>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:251-289</span>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:367-384</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>7. 只有满足条件时才走“设备定时发送”</h3>
+            <p><code>_should_schedule_frame_batch()</code> 的判断很严格：必须至少有 2 条仍然启用的帧，第一条已经到点，最后一条还在 2 ms 调度窗口内，且每条帧的总线类型都属于 <code>CAN/J1939</code>，同时适配器声明支持 <code>queue_send</code>。因为 <code>SCHEDULED_FRAME_BUS_TYPES</code> 不包含 CAN FD，所以 CAN FD 天然走不到这个分支。</p>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:38-41</span>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:386-416</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>8. 帧真正发送前还会经过两层处理</h3>
+            <p>第一层是 <code>FrameEnableService</code>，按“逻辑通道 + 报文 ID”判断这帧是不是被临时禁用；第二层是 <code>SignalOverrideService.apply()</code>，按 DBC 对 payload 做重新编码。对于 CAN FD，如果改包后 payload 长度变化，会再次通过 <code>canfd_payload_length_to_dlc()</code> 把真实长度映射回内部 DLC 码值。</p>
+            <span class="code-ref">src/replay_platform/services/frame_enable.py:8-34</span>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:421-446</span>
+            <span class="code-ref">src/replay_platform/services/signal_catalog.py:205-208</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>9. 逻辑通道在这里才映射成真实设备通道</h3>
+            <p>引擎按场景里的 binding 找到逻辑通道对应的适配器和物理通道，然后把帧 clone 成“物理通道版本”，再按适配器分组。这个阶段之后，同一个适配器内的原始顺序会被保留，但已经不再区分回放文件来源。</p>
+            <span class="code-ref">src/replay_platform/runtime/engine.py:428-446</span>
+          </div>
+
+          <div class="timeline-item">
+            <h3>10. ZLG CAN FD 发送使用真实 payload 长度，而不是内部 DLC 码值</h3>
+            <p>ZLG 适配器会先按物理通道再拆一次。对于 CAN FD，<code>_send_fd()</code> 会把 payload 截到 64 字节以内，然后把 <code>len(payload)</code> 写入 SDK 结构的 <code>frame.len</code>。BRS 通过 <code>flags &amp; 0x01</code> 写回，<code>tx_echo</code> 通过 <code>0x20</code> 写回；但从当前实现看，导入时保留的 <code>esi</code> 并没有在发送时参与写入。</p>
+            <span class="code-ref">src/replay_platform/adapters/zlg.py:117-131</span>
+            <span class="code-ref">src/replay_platform/adapters/zlg.py:298-311</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>CAN FD 的特殊路径</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>环节</th>
+              <th>当前逻辑</th>
+              <th>对回放行为的影响</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Trace 导入</td>
+              <td>ASC 会解析 <code>brs/esi/dlc/data_length</code>；BLF 会根据 <code>is_fd</code> 判定 CAN FD，并把 payload 长度重新映射为 DLC 码值。</td>
+              <td>内部统一成 <code>FrameEvent(bus_type=CANFD)</code>，后续不再依赖源文件格式。</td>
+            </tr>
+            <tr>
+              <td>统一时间轴调度</td>
+              <td>和 CAN/J1939 共用同一个 <code>ts_ns</code> 逻辑时间轴。</td>
+              <td>暂停 / 恢复 / 循环回放对 CAN FD 同样生效。</td>
+            </tr>
+            <tr>
+              <td>2ms 分片</td>
+              <td>CAN FD 也会进入 2 ms 分片，但不会进入设备定时队列判断的成功分支。</td>
+              <td>同一 slice 内多个 CAN FD 帧会被立刻批量下发，而不是由引擎显式保留微小时隙。</td>
+            </tr>
+            <tr>
+              <td>信号覆盖</td>
+              <td>如 DBC 重编码后字节数变化，会重算 DLC 码值。</td>
+              <td>内部 DLC 一致性可以维持，但最终下发给 ZLG 的仍是“真实字节长度”。</td>
+            </tr>
+            <tr>
+              <td>ZLG 发送</td>
+              <td><code>TransmitFD</code> 的 <code>frame.len</code> 直接使用 payload 字节数。</td>
+              <td>16/24/64 字节这类 CAN FD 负载会按真实长度下发，不靠 DLC 码值反解。</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="note">
+          <strong>这一点最容易误判</strong>
+          引擎内部确实保存了 CAN FD 的 DLC 码值，但 ZLG 发送阶段真正起作用的是 payload 的真实字节数。现有适配器测试也专门验证了 16/24/64 字节 payload 会正确写入设备发送结构。
+          <span class="code-ref">tests/test_zlg_adapter.py:78 / 125 / 150</span>
+        </div>
+      </section>
+
+      <section class="card half">
+        <h2>暂停、继续、停止、循环</h2>
+        <ul class="plain-list">
+          <li><strong>暂停：</strong><code>pause()</code> 把状态改成 <code>PAUSED</code>，并记录 <code>_pause_started_ns</code>。<span class="code-ref">src/replay_platform/runtime/engine.py:140-151</span></li>
+          <li><strong>继续：</strong><code>resume()</code> 不改时间轴本身，而是把暂停耗时补加到 <code>_base_perf_ns</code> 上，等于整体平移时间基准。<span class="code-ref">src/replay_platform/runtime/engine.py:153-164</span></li>
+          <li><strong>停止：</strong><code>stop()</code> 会停线程、停诊断 worker、关闭适配器、重置索引，并清空信号覆盖。应用层同时会清空帧使能规则。<span class="code-ref">src/replay_platform/runtime/engine.py:167-188</span><span class="code-ref">src/replay_platform/app_controller.py:221-224</span></li>
+          <li><strong>循环回放：</strong>到时间轴末尾后会重新关闭并打开适配器、重置索引和时间基准，但累计统计不会清零，只增加 <code>completed_loops</code>。<span class="code-ref">src/replay_platform/runtime/engine.py:290-342</span></li>
+        </ul>
+        <div class="note">
+          <strong>对 CAN FD 的含义</strong>
+          CAN FD 没有独立的暂停或循环实现，完全继承统一时间轴的状态机行为。
+        </div>
+      </section>
+
+      <section class="card half">
+        <h2>链路动作对回放的影响</h2>
+        <ul class="plain-list">
+          <li>链路动作是时间轴里的正式事件，不是旁路逻辑。<span class="code-ref">src/replay_platform/core.py:261</span></li>
+          <li>引擎遇到 <code>LinkAction</code> 时会同步执行断开或重连；如果指定了逻辑通道，还会重新 <code>start_channel()</code>。<span class="code-ref">src/replay_platform/runtime/engine.py:489-507</span></li>
+          <li>由于链路动作会打断连续帧窗口，所以一个本来能合批的 slice 会被拆开。现有测试已经覆盖这个行为。<span class="code-ref">tests/test_engine.py:597 / 1077</span></li>
+        </ul>
+        <div class="note warn">
+          <strong>当前实现的真实边界</strong>
+          从代码看，链路动作之后没有“显式丢弃已过期帧”的逻辑。也就是说，如果重连动作本身耗时较长，后续目标时间已经过去的帧会在循环继续时立即发送，而不是自动跳过。
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>测试已经证明了什么</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>测试</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tests/test_engine.py:1008</code></td>
+              <td>未来时间的经典 CAN 批次会走 <code>send_scheduled()</code>。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_engine.py:1111</code></td>
+              <td>CAN FD 批次不会进入定时发送路径，而是回退到普通立即发送。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_engine.py:1033</code></td>
+              <td>批次里如果只剩 1 条启用帧，也不会走定时发送。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_engine.py:538</code></td>
+              <td>临时禁用规则会让指定帧直接被跳过，并累加到 <code>skipped_frames</code>。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_engine.py:234</code></td>
+              <td>暂停后 snapshot 会变成 <code>PAUSED</code>，停止后索引归零。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_engine.py:286</code></td>
+              <td>循环回放会重启时间轴并累计已完成圈数。</td>
+            </tr>
+            <tr>
+              <td><code>tests/test_zlg_adapter.py:78 / 125 / 150</code></td>
+              <td>ZLG CAN FD 发送与接收转换都按真实 payload 长度和 DLC 映射处理。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>我认为最值得关注的实现特征</h2>
+        <ol class="plain-list">
+          <li><strong>当前 CAN FD 回放更像“统一时间轴 + 立即批量发送”</strong>，而不是“设备侧精确定时发送”。2 ms slice 仍然存在，但更多是为了统一调度和合批，不是为了给 CAN FD 保留精细间隔。</li>
+          <li><strong>信号覆盖在发送前最后一跳生效</strong>，因此 CAN FD payload 长度理论上可以被 DBC 重编码改变；引擎会同步修正内部 DLC。</li>
+          <li><strong>链路动作是强同步点</strong>，它会打断合批，甚至可能把后续帧推成“超时后立即发送”的状态。</li>
+          <li><strong>暂停/继续处理得比较干净</strong>，它通过平移基准时间避免了暂停期间的时间追赶，这一点对 CAN FD 也成立。</li>
+        </ol>
+      </section>
+    </div>
+
+    <div class="footer">
+      文档文件：C:\code\replay\docs\canfd_replay_analysis.html
+    </div>
+  </div>
+</body>
+</html>
