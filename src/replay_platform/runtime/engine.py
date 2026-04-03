@@ -36,7 +36,7 @@ from replay_platform.services.signal_catalog import SignalOverrideService
 
 
 FRAME_SLICE_WINDOW_NS = 2_000_000
-FRAME_QUEUE_LOOKAHEAD_NS = 20_000_000
+FRAME_SCHEDULE_WINDOW_NS = FRAME_SLICE_WINDOW_NS
 FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
 SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.J1939})
 
@@ -266,7 +266,7 @@ class ReplayEngine:
             self._update_runtime_snapshot_for_item(item, self._timeline_index)
             target_ns = self._base_perf_ns + item.ts_ns
             now_ns = time.perf_counter_ns()
-            if frame_batch and self._should_schedule_frame_batch(frame_batch, target_ns, now_ns):
+            if frame_batch and self._should_schedule_frame_batch(frame_batch, now_ns):
                 try:
                     self._dispatch_frame_batch(frame_batch, scheduled=True)
                 except Exception as exc:  # pragma: no cover - defensive runtime logging
@@ -386,11 +386,17 @@ class ReplayEngine:
     def _should_schedule_frame_batch(
         self,
         frames: Sequence[FrameEvent],
-        target_ns: int,
         now_ns: int,
     ) -> bool:
         enabled_frames = self._enabled_frames(frames)
-        if not enabled_frames or target_ns <= now_ns or target_ns - now_ns > FRAME_QUEUE_LOOKAHEAD_NS:
+        if len(enabled_frames) < 2:
+            return False
+        first_target_ns = self._base_perf_ns + enabled_frames[0].ts_ns
+        latest_target_ns = self._base_perf_ns + enabled_frames[-1].ts_ns
+        # Only use device scheduling to preserve the remaining gap inside one 2ms slice.
+        if first_target_ns > now_ns:
+            return False
+        if latest_target_ns <= now_ns or latest_target_ns - now_ns > FRAME_SCHEDULE_WINDOW_NS:
             return False
         checked_adapters: set[str] = set()
         for frame in enabled_frames:

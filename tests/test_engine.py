@@ -38,10 +38,15 @@ class RecordingMockDeviceAdapter(MockDeviceAdapter):
     def __init__(self, adapter_id: str = "mock", channel_count: int = 4) -> None:
         super().__init__(adapter_id, channel_count=channel_count)
         self.send_batches: list[list[FrameEvent]] = []
+        self.scheduled_call_offsets_ns: list[int] = []
 
     def send(self, batch):
         self.send_batches.append([item.clone() for item in batch])
         return super().send(batch)
+
+    def send_scheduled(self, batch, enqueue_base_ns):
+        self.scheduled_call_offsets_ns.append(time.perf_counter_ns() - enqueue_base_ns)
+        return super().send_scheduled(batch, enqueue_base_ns)
 
 
 class PartialSendMockDeviceAdapter(RecordingMockDeviceAdapter):
@@ -1017,14 +1022,15 @@ class ReplayEngineTests(unittest.TestCase):
             ],
         )
         frames = [
-            FrameEvent(ts_ns=5_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
-            FrameEvent(ts_ns=6_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
         ]
         self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
         self.assertEqual(1, len(adapter.scheduled_batches))
         self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.scheduled_batches[0]])
+        self.assertGreaterEqual(adapter.scheduled_call_offsets_ns[0], 18_000_000)
 
-    def test_scheduled_send_uses_only_enabled_frames_in_batch(self):
+    def test_single_enabled_frame_in_batch_falls_back_to_immediate_send(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=2)
         frame_enables = FrameEnableService()
         frame_enables.set_rule(FrameEnableRule(logical_channel=1, message_id=0x101, enabled=False))
@@ -1062,12 +1068,13 @@ class ReplayEngineTests(unittest.TestCase):
             frame_enables=frame_enables,
         )
 
-        self.assertEqual(1, len(adapter.scheduled_batches))
-        self.assertEqual([0x100], [frame.message_id for frame in adapter.scheduled_batches[0]])
+        self.assertEqual([], adapter.scheduled_batches)
+        self.assertEqual(1, len(adapter.send_batches))
+        self.assertEqual([0x100], [frame.message_id for frame in adapter.send_batches[0]])
         self.assertEqual(1, engine.stats.sent_frames)
         self.assertEqual(1, engine.stats.skipped_frames)
 
-    def test_scheduled_send_does_not_cross_link_action(self):
+    def test_link_action_prevents_scheduled_send_across_batches(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
         scenario = ScenarioSpec(
             scenario_id="s-scheduled-barrier",
@@ -1084,7 +1091,7 @@ class ReplayEngineTests(unittest.TestCase):
             ],
             link_actions=[
                 LinkAction(
-                    ts_ns=7_000_000,
+                    ts_ns=20_500_000,
                     adapter_id="mock-1",
                     action=LinkActionType.RECONNECT,
                     logical_channel=0,
@@ -1092,11 +1099,14 @@ class ReplayEngineTests(unittest.TestCase):
             ],
         )
         frames = [
-            FrameEvent(ts_ns=5_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
-            FrameEvent(ts_ns=10_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
         ]
-        self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
-        self.assertEqual([[0x100], [0x101]], [[frame.message_id for frame in batch] for batch in adapter.scheduled_batches])
+        engine = self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+        self.assertEqual([], adapter.scheduled_batches)
+        self.assertEqual([[0x100], [0x101]], [[frame.message_id for frame in batch] for batch in adapter.send_batches])
+        self.assertGreaterEqual(adapter.reconnect_count, 1)
+        self.assertEqual(1, engine.stats.link_actions)
 
     def test_canfd_batch_falls_back_to_immediate_send(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
