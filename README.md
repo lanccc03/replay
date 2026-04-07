@@ -2,7 +2,7 @@
 
 面向 Windows 的多总线回放与诊断桌面工具，围绕 ZLG 设备覆盖 CAN、CANFD、J1939、DoIP 的统一回放、场景管理、信号在线改值和 DTC 诊断流程。
 
-更详细的专题说明已经拆分到 [`docs/`](docs/README.md)；如果你是工程代理，请先读 [`AGENTS.md`](AGENTS.md)。
+更详细的专题说明已经拆分到 [`docs/`](docs/README.md)；如果你是工程代理，请先读 [`agents.md`](agents.md)。
 
 ## 1. 项目定位与范围
 
@@ -104,11 +104,11 @@ replay/
 - [`docs/scenario-and-trace.md`](docs/scenario-and-trace.md)：场景 JSON、trace 导入、信号覆盖、运行数据目录
 - [`docs/diagnostics.md`](docs/diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
 - [`docs/zlg-hardware.md`](docs/zlg-hardware.md)：Windows / ZLG 环境准备、已知限制、联调顺序
-- [`docs/testing.md`](docs/testing.md)：常用命令、测试映射、最低验证要求
+- [`docs/testing.md`](docs/testing.md)：验证命令、测试映射、最低验证要求与验证边界
 
 如果你是在本仓库中执行改动任务的工程代理，请额外阅读：
 
-- [`AGENTS.md`](AGENTS.md)
+- [`agents.md`](agents.md)
 
 ## 6. 关键入口
 

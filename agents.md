@@ -1,120 +1,63 @@
 # 项目 Agent 指南
 
-本文件面向在本仓库中执行任务的工程代理，目标是减少误改、重复探索和与项目边界冲突的实现。
+本文件只保留工程代理执行任务时必须先知道的约束。项目背景、架构细节和专题说明请看 `README.md` 与 `docs/`。
 
-## 1. 项目定位
+## 1. 开始前先读
 
-- 项目类型：Windows 多总线 Replay / 诊断桌面工具
-- 技术栈：Python、PySide6、SQLite、python-can、cantools
-- 当前重点：ZLG 设备上的 CAN / CANFD / J1939 / DoIP 场景回放与诊断
-- 当前 UI 语言：中文
+- 必读：
+  - `README.md`
+  - `docs/architecture.md`
+  - `src/replay_platform/core.py`
+  - `src/replay_platform/app_controller.py`
+  - `src/replay_platform/runtime/engine.py`
+  - `src/replay_platform/ui/main_window.py`
+- 按任务补读：
+  - 场景 / trace / 信号覆盖：`docs/scenario-and-trace.md`
+  - 诊断：`docs/diagnostics.md`
+  - Windows / ZLG 边界：`docs/zlg-hardware.md`
+  - 验证要求：`docs/testing.md`
+  - Trace 导入：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
+  - DBC / 信号覆盖：`src/replay_platform/services/signal_catalog.py`
+  - ZLG 设备：`src/replay_platform/adapters/zlg.py`
+  - 录制：`src/replay_platform/runtime/recorder.py`
 
-## 2. 先读顺序
+## 2. 不要越界
 
-开始改动前，优先读这些文件：
-
-- `README.md`
-- `docs/architecture.md`
-- `src/replay_platform/core.py`
-- `src/replay_platform/app_controller.py`
-- `src/replay_platform/runtime/engine.py`
-- `src/replay_platform/ui/main_window.py`
-
-## 3. 按主题阅读
-
-如果任务与具体能力相关，再按主题继续读：
-
-- 场景结构 / trace / 信号覆盖：`docs/scenario-and-trace.md`
-- CAN UDS / DoIP / DTC：`docs/diagnostics.md`
-- Windows / ZLG 设备边界：`docs/zlg-hardware.md`
-- 验证要求 / 测试映射：`docs/testing.md`
-- Trace 导入/缓存：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
-- 信号覆盖 / DBC：`src/replay_platform/services/signal_catalog.py`
-- ZLG 设备：`src/replay_platform/adapters/zlg.py`
-- 录制：`src/replay_platform/runtime/recorder.py`
-
-## 4. 目录职责
-
-- `src/replay_platform/core.py`
-  定义核心数据契约。任何场景结构、时间轴事件、诊断对象的修改，都要先看这里。
-- `src/replay_platform/app_controller.py`
-  UI 与底层能力的编排入口。不要把复杂业务逻辑堆到界面层。
-- `src/replay_platform/runtime/`
-  回放状态机、统一时间轴、录制逻辑。
-- `src/replay_platform/services/`
-  文件库、场景库、信号编解码、数据库绑定。
-- `src/replay_platform/adapters/`
-  设备抽象层。ZLG 是已实现路径，同星当前只有占位接口。
-- `src/replay_platform/diagnostics/`
-  CAN UDS、DoIP、DTC 解析。
-- `src/replay_platform/ui/`
-  Qt 桌面界面。当前主界面和二级场景编辑器都在 `main_window.py`。
-- `tests/`
-  单元测试。改动解析、场景结构、运行时逻辑时必须补测试。
-
-## 5. 关键边界与禁止事项
-
-- ZLG 真实硬件能力只能在 Windows 上验证。
-- 当前机器如果不是 Windows，允许做结构开发、单元测试和语法检查，但不能声称已完成硬件联调。
-- ETH 在 V1 中主要指 DoIP 诊断链路，不是通用原始以太网帧回放。
-- 在线信号改值依赖 DBC / J1939 DBC；没有数据库绑定时，不支持信号级编辑。
-- 同星适配器当前是占位接口，不要伪造“已支持同星硬件”。
-- 场景结构必须兼容 `ScenarioSpec.from_dict()` / `to_dict()`。
-- 当前产品界面是中文；新增 UI 文案默认保持中文。
-- 只有在确有必要时才修改 `zlgcan_python_251211/` 下的 SDK 封装。
+- ZLG 真机能力只能在 Windows 上验证；非 Windows 只能做结构开发、单元测试和语法检查。
+- V1 的 `ETH` 主要指 DoIP 诊断链路，不是通用原始以太网帧回放。
+- 在线信号改值依赖 DBC / J1939 DBC；未绑定数据库时不要声称支持信号级编辑。
+- 同星适配器当前仍是占位路径，不要伪造“已支持同星硬件”。
+- 场景结构必须继续兼容 `ScenarioSpec.from_dict()` / `to_dict()`。
+- 新增 UI 文案默认保持中文。
+- `zlgcan_python_251211/` 只在确有必要时修改。
 - 不要提交或依赖 `__pycache__` 内容。
 
-## 6. Agent 改动原则
+## 3. 改动原则
 
-- 先沿现有架构扩展，不要平白再造一层抽象。
-- 涉及场景结构变更时，先确认 `core.py`、UI、持久化、运行时四处是否都要同步。
-- 涉及回放时序的改动，重点检查：
+- 先沿现有架构扩展，不平白增加新抽象层。
+- 涉及场景结构时，同时检查 `core.py`、UI、持久化、运行时是否要同步。
+- 涉及回放时序时，重点检查：
   - `pause / resume`
   - `trace_file_ids` 为空时的回退逻辑
   - 链路断开 / 恢复后是否错误补发过期帧
-- 涉及 UI 改动时，不要把业务判断塞进控件槽函数里；优先抽成小函数。
+- 涉及 UI 改动时，把业务判断抽成小函数，不堆在槽函数里。
+- 涉及场景编辑器时，确认导出结果仍能直接 `ScenarioSpec.from_dict()`，且主窗口开始回放时能拿到最新场景。
 
-## 7. 场景编辑器注意事项
+## 4. 验证与交付
 
-- 当前主窗口只做：
-  - 文件库
-  - 场景列表
-  - 当前场景摘要
-  - 回放控制
-  - 手动信号覆盖
-  - 日志查看
-- 场景编辑器在二级窗口中，负责：
-  - 表单编辑
-  - JSON 编辑
-  - 场景保存
-  - 场景内容与主窗口摘要同步
-- 若修改场景编辑器，请同步检查：
-  - 二级窗口导出的场景是否仍能直接 `ScenarioSpec.from_dict()`
-  - 主窗口开始回放时是否读取到最新场景
+- 详细命令和测试映射统一看 `docs/testing.md`。
+- 纯文档改动：至少检查路径、模块名、命令与仓库一致。
+- 纯 UI 改动：至少做 `python -m compileall src tests`；若涉及表单解析或场景编辑逻辑，补或更新 `tests/test_ui_helpers.py`。
+- 运行时 / 解析 / 场景结构改动：运行全部 `unittest`，并补对应模块测试。
+- 最终说明里必须写清楚：
+  - 已验证了什么
+  - 未验证什么
+  - 是否未做 Qt 手工点击验证 / Windows 硬件验证
 
-## 8. 最低验证要求
+## 5. 交付前自检
 
-详细命令与测试映射见 `docs/testing.md`。最低要求如下：
-
-### 8.1 纯文档改动
-
-- 检查路径、模块名、命令是否与仓库一致
-
-### 8.2 纯 UI 改动
-
-- `python -m compileall src tests`
-- 如果改动涉及表单解析或场景编辑逻辑，补或更新 `tests/test_ui_helpers.py`
-
-### 8.3 运行时 / 解析 / 场景结构改动
-
-- 运行全部 `unittest`
-- 补对应模块测试
-- 明确说明是否未做 Qt 手工点击验证 / Windows 硬件验证
-
-## 9. 提交前自检清单
-
-- 是否破坏了 `ScenarioSpec` 的 JSON 兼容性
-- 是否新增了英文 UI 文案
+- 是否破坏 `ScenarioSpec` 的 JSON 兼容性
+- 是否新增英文 UI 文案
 - 是否把 Windows 专属能力误写成跨平台可用
-- 是否修改了 ZLG / DoIP 行为但没有补测试或说明限制
-- 是否在最终说明中明确了“已验证”和“未验证”的边界
+- 是否修改了 ZLG / DoIP 行为却没有补测试或说明限制
+- 是否明确写出“已验证 / 未验证”的边界
