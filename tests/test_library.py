@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,20 @@ class FileLibraryTests(unittest.TestCase):
             self.assertTrue(Path(record.metadata["cache_path"]).exists())
             self.assertEqual(".rplbin", Path(record.metadata["cache_path"]).suffix)
 
+    def test_import_trace_writes_source_summaries(self):
+        fixture = Path(__file__).parent / "fixtures" / "sample.asc"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = FileLibraryService(AppPaths(Path(tmp)), TraceLoader())
+            record = service.import_trace(str(fixture))
+
+            source_summaries = record.metadata.get("source_summaries", [])
+
+            self.assertTrue(source_summaries)
+            self.assertIn("source_channel", source_summaries[0])
+            self.assertIn("bus_type", source_summaries[0])
+            self.assertIn("frame_count", source_summaries[0])
+            self.assertIn("label", source_summaries[0])
+
     def test_load_trace_events_migrates_legacy_json_cache(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,6 +76,24 @@ class FileLibraryTests(unittest.TestCase):
             self.assertEqual(BINARY_CACHE_FORMAT, migrated.metadata["cache_format"])
             self.assertTrue(Path(migrated.metadata["cache_path"]).exists())
             self.assertEqual(".rplbin", Path(migrated.metadata["cache_path"]).suffix)
+
+    def test_get_trace_source_summaries_backfills_missing_metadata(self):
+        fixture = Path(__file__).parent / "fixtures" / "sample.asc"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = FileLibraryService(AppPaths(Path(tmp)), TraceLoader())
+            record = service.import_trace(str(fixture))
+            with service._connect() as connection:
+                connection.execute(
+                    "UPDATE trace_files SET metadata_json = ? WHERE trace_id = ?",
+                    (json.dumps({"cache_path": record.metadata["cache_path"], "cache_format": BINARY_CACHE_FORMAT}), record.trace_id),
+                )
+
+            summaries = service.get_trace_source_summaries(record.trace_id)
+            refreshed = service.get_trace_file(record.trace_id)
+
+            self.assertTrue(summaries)
+            assert refreshed is not None
+            self.assertEqual(summaries, refreshed.metadata["source_summaries"])
 
     def test_delete_trace_removes_record_library_file_and_cache(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"

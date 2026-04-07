@@ -19,12 +19,14 @@ from replay_platform.core import (
     BusType,
     DeviceChannelBinding,
     FrameEnableRule,
+    FrameEvent,
     ReplayFrameLogMode,
     ReplayLaunchSource,
     ReplayLogConfig,
     ReplayLogLevel,
     ReplayState,
     ScenarioSpec,
+    TraceFileRecord,
 )
 from replay_platform.ui.main_window import _plan_log_refresh
 
@@ -242,6 +244,96 @@ class ReplayApplicationLogTests(unittest.TestCase):
 
             adapter_cls.assert_called_once_with("tongxing0", seed)
             self.assertIs(adapter_cls.return_value, adapters["tongxing0"])
+
+    def test_load_replay_frames_maps_same_source_channel_from_different_files(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-map-1",
+                name="文件映射",
+                trace_file_ids=["trace-a", "trace-b"],
+                bindings=[
+                    DeviceChannelBinding(
+                        trace_file_id="trace-a",
+                        source_channel=0,
+                        source_bus_type=BusType.CANFD,
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=10,
+                        physical_channel=0,
+                        bus_type=BusType.CANFD,
+                        device_type="MOCK",
+                    ),
+                    DeviceChannelBinding(
+                        trace_file_id="trace-b",
+                        source_channel=0,
+                        source_bus_type=BusType.CANFD,
+                        adapter_id="mock1",
+                        driver="mock",
+                        logical_channel=11,
+                        physical_channel=1,
+                        bus_type=BusType.CANFD,
+                        device_type="MOCK",
+                    ),
+                ],
+            )
+            trace_a_events = [
+                FrameEvent(ts_ns=1, bus_type=BusType.CANFD, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+                FrameEvent(ts_ns=2, bus_type=BusType.CANFD, channel=1, message_id=0x101, payload=b"\x02", dlc=1),
+            ]
+            trace_b_events = [
+                FrameEvent(ts_ns=3, bus_type=BusType.CANFD, channel=0, message_id=0x200, payload=b"\x03", dlc=1),
+            ]
+            with patch.object(
+                app.library,
+                "get_trace_file",
+                side_effect=[
+                    TraceFileRecord("trace-a", "a.asc", "C:/a.asc", "C:/lib/a.asc", "asc", "now"),
+                    TraceFileRecord("trace-b", "b.asc", "C:/b.asc", "C:/lib/b.asc", "asc", "now"),
+                ],
+            ), patch.object(app.library, "load_trace_events", side_effect=[trace_a_events, trace_b_events]):
+                frames = app._load_replay_frames(scenario)
+
+            self.assertEqual([10, 11], [frame.channel for frame in frames])
+            self.assertEqual([0x100, 0x200], [frame.message_id for frame in frames])
+            self.assertEqual(["C:/a.asc", "C:/b.asc"], [frame.source_file for frame in frames])
+
+    def test_load_replay_frames_keeps_only_selected_source_from_multi_channel_file(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-map-2",
+                name="单文件多通道",
+                trace_file_ids=["trace-a"],
+                bindings=[
+                    DeviceChannelBinding(
+                        trace_file_id="trace-a",
+                        source_channel=2,
+                        source_bus_type=BusType.CAN,
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=5,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+            trace_events = [
+                FrameEvent(ts_ns=1, bus_type=BusType.CAN, channel=2, message_id=0x300, payload=b"\x01", dlc=1),
+                FrameEvent(ts_ns=2, bus_type=BusType.CANFD, channel=2, message_id=0x301, payload=b"\x02", dlc=1),
+                FrameEvent(ts_ns=3, bus_type=BusType.CAN, channel=3, message_id=0x302, payload=b"\x03", dlc=1),
+            ]
+            with patch.object(
+                app.library,
+                "get_trace_file",
+                return_value=TraceFileRecord("trace-a", "a.asc", "C:/a.asc", "C:/lib/a.asc", "asc", "now"),
+            ), patch.object(app.library, "load_trace_events", return_value=trace_events):
+                frames = app._load_replay_frames(scenario)
+
+            self.assertEqual(1, len(frames))
+            self.assertEqual(5, frames[0].channel)
+            self.assertEqual(0x300, frames[0].message_id)
 
 
 if __name__ == "__main__":

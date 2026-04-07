@@ -6,6 +6,8 @@ import tests.bootstrap  # noqa: F401
 
 from replay_platform.ui.main_window import (
     _assess_scenario_launch,
+    _binding_device_type_options,
+    _binding_device_type_warning,
     _build_log_level_hint,
     _format_replay_stats,
     _binding_draft_from_item,
@@ -31,6 +33,7 @@ from replay_platform.ui.main_window import (
     _log_level_option,
     _parse_log_level_option,
     _normalize_binding_item,
+    _new_binding_draft,
     _scenario_payload_is_dirty,
     _should_reset_current_scenario_after_delete,
     _validate_binding_draft,
@@ -121,6 +124,18 @@ class MainWindowHelperTests(unittest.TestCase):
         self.assertIn("采样", _build_log_level_hint(LOG_LEVEL_PRESET_DEBUG_SAMPLED))
         self.assertIn("逐帧", _build_log_level_hint(LOG_LEVEL_PRESET_DEBUG_ALL))
 
+    def test_new_binding_draft_leaves_zlg_device_type_empty(self) -> None:
+        draft = _new_binding_draft(3)
+
+        self.assertEqual("zlg", draft["driver"])
+        self.assertEqual("", draft["device_type"])
+        self.assertEqual("3", draft["physical_channel"])
+
+    def test_binding_device_type_options_follow_driver(self) -> None:
+        self.assertIn("USBCANFD_200U", _binding_device_type_options("zlg"))
+        self.assertEqual(("MOCK",), _binding_device_type_options("mock"))
+        self.assertEqual(("TC1014",), _binding_device_type_options("tongxing"))
+
     def test_validate_binding_draft_reports_required_bool_and_json_errors(self) -> None:
         binding_payload = {
             "adapter_id": "",
@@ -148,6 +163,56 @@ class MainWindowHelperTests(unittest.TestCase):
             ["bindings[0].adapter_id", "bindings[0].resistance_enabled", "bindings[0].network"],
             [issue.path for issue in issues],
         )
+
+    def test_validate_binding_draft_allows_empty_zlg_device_type(self) -> None:
+        normalized, issues = _validate_binding_draft(
+            {
+                "adapter_id": "zlg0",
+                "driver": "zlg",
+                "logical_channel": "0",
+                "physical_channel": "0",
+                "bus_type": "CANFD",
+                "device_type": "",
+                "device_index": "0",
+                "sdk_root": "zlgcan_python_251211",
+                "nominal_baud": "500000",
+                "data_baud": "2000000",
+                "resistance_enabled": True,
+                "listen_only": False,
+                "tx_echo": False,
+                "merge_receive": False,
+                "network": "{}",
+                "metadata": "{}",
+            },
+            0,
+        )
+
+        self.assertEqual([], issues)
+        self.assertEqual("", normalized["device_type"])
+
+    def test_normalize_binding_item_allows_empty_zlg_device_type(self) -> None:
+        normalized = _normalize_binding_item(
+            {
+                "adapter_id": "zlg0",
+                "driver": "zlg",
+                "logical_channel": "0",
+                "physical_channel": "0",
+                "bus_type": "CANFD",
+                "device_type": "",
+                "device_index": "0",
+                "sdk_root": "zlgcan_python_251211",
+                "nominal_baud": "500000",
+                "data_baud": "2000000",
+                "resistance_enabled": True,
+                "listen_only": False,
+                "tx_echo": False,
+                "merge_receive": False,
+                "network": "{}",
+                "metadata": "{}",
+            }
+        )
+
+        self.assertEqual("", normalized["device_type"])
 
     def test_binding_draft_from_item_uses_tongxing_sdk_default(self) -> None:
         draft = _binding_draft_from_item(
@@ -213,6 +278,53 @@ class MainWindowHelperTests(unittest.TestCase):
         self.assertEqual([], issues)
         self.assertEqual("TSMasterApi", normalized["sdk_root"])
 
+    def test_binding_device_type_warning_reports_empty_zlg_as_warning(self) -> None:
+        warning = _binding_device_type_warning(
+            {
+                "adapter_id": "zlg0",
+                "driver": "zlg",
+                "logical_channel": 0,
+                "device_type": "",
+            },
+            0,
+        )
+
+        self.assertIsNotNone(warning)
+        self.assertEqual("bindings[0].device_type", warning.path)
+        self.assertIn("尚未选择具体 ZLG 设备类型", warning.message)
+
+    def test_binding_device_type_warning_reports_legacy_zlg_alias(self) -> None:
+        warning = _binding_device_type_warning(
+            {
+                "adapter_id": "zlg0",
+                "driver": "zlg",
+                "logical_channel": 0,
+                "device_type": "USBCANFD",
+            },
+            0,
+        )
+
+        self.assertIsNotNone(warning)
+        self.assertIn("旧写法 USBCANFD", warning.message)
+
+    def _obsolete_assess_binding_probe_requires_specific_zlg_device_type(self) -> None:
+        empty_assessment = _assess_binding_probe("zlg", "CANFD", "")
+        legacy_assessment = _assess_binding_probe("zlg", "CANFD", "USBCANFD")
+        ready_assessment = _assess_binding_probe("zlg", "CANFD", "USBCANFD_200U")
+
+        self.assertFalse(empty_assessment.ready)
+        self.assertIn("请先选择具体设备类型", empty_assessment.message)
+        self.assertFalse(empty_assessment.include_current_value)
+        self.assertFalse(legacy_assessment.ready)
+        self.assertIn("旧写法", legacy_assessment.message)
+        self.assertFalse(legacy_assessment.include_current_value)
+        self.assertTrue(ready_assessment.ready)
+
+    def _obsolete_physical_channel_option_values_can_hide_current_placeholder(self) -> None:
+        self.assertEqual([], _physical_channel_option_values([], "0", include_current_value=False))
+        self.assertEqual(["0", "1"], _physical_channel_option_values(["0", "1"], "0", include_current_value=False))
+        self.assertEqual(["1", "2"], _physical_channel_option_values(["1"], "2", include_current_value=True))
+
     def test_build_json_preview_uses_last_valid_payload_when_errors_exist(self) -> None:
         last_valid_payload = {
             "scenario_id": "scenario-1",
@@ -243,6 +355,34 @@ class MainWindowHelperTests(unittest.TestCase):
         }
 
         self.assertEqual("zlg0 | zlg | LC0->PC1 | CANFD/USBCANFD", _binding_summary(binding_payload))
+
+    def test_binding_summary_formats_file_mapping_label(self) -> None:
+        binding_payload = {
+            "trace_file_id": "trace-a",
+            "source_channel": 0,
+            "source_bus_type": "CANFD",
+            "adapter_id": "zlg0",
+            "driver": "zlg",
+            "logical_channel": "0",
+            "physical_channel": "1",
+            "bus_type": "CANFD",
+            "device_type": "USBCANFD",
+        }
+        trace_lookup = {
+            "trace-a": TraceFileRecord(
+                trace_id="trace-a",
+                name="can.asc",
+                original_path="/tmp/can.asc",
+                library_path="/tmp/cache.asc",
+                format="asc",
+                imported_at="now",
+            )
+        }
+
+        self.assertEqual(
+            "can.asc | CH0 | CANFD -> zlg0/PC1 | zlg | CANFD/USBCANFD",
+            _binding_summary(binding_payload, trace_lookup),
+        )
 
     def test_frame_enable_rule_summary_formats_compact_label(self) -> None:
         rule = FrameEnableRule(logical_channel=1, message_id=0x123, enabled=False)
@@ -418,8 +558,8 @@ class MainWindowHelperTests(unittest.TestCase):
         summary = _build_scenario_business_summary(payload, trace_lookup)
 
         self.assertEqual("回放文件：can.asc，缺失文件（trace-missing）", summary.trace_text)
-        self.assertEqual("通道绑定：LC0 -> mock0/PC1 CANFD", summary.binding_text)
-        self.assertEqual("数据库绑定：LC0 -> vehicle.dbc", summary.database_text)
+        self.assertEqual("通道绑定：LC0（旧映射） -> mock0/PC1 CANFD", summary.binding_text)
+        self.assertEqual("数据库绑定：LC0（旧映射） -> vehicle.dbc", summary.database_text)
 
     def test_filter_helpers_use_case_insensitive_contains(self) -> None:
         traces = [
@@ -530,6 +670,71 @@ class MainWindowHelperTests(unittest.TestCase):
         self.assertEqual("当前来源：body.asc", summary.source_text)
         self.assertIn("mock0 在线", summary.device_text)
         self.assertEqual("启动来源：主窗口选中文件回退", summary.launch_text)
+
+    def test_assess_scenario_launch_requires_all_checked_files_mapped_for_file_mapping(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "文件映射场景",
+            "trace_file_ids": ["trace-a", "trace-b"],
+            "bindings": [
+                {
+                    "trace_file_id": "trace-a",
+                    "source_channel": 0,
+                    "source_bus_type": "CANFD",
+                    "adapter_id": "mock0",
+                    "driver": "mock",
+                    "logical_channel": 0,
+                    "physical_channel": 0,
+                    "bus_type": "CANFD",
+                    "device_type": "MOCK",
+                }
+            ],
+            "database_bindings": [],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+
+        result = _assess_scenario_launch(payload, ["fallback-trace"])
+
+        self.assertFalse(result.ready)
+        self.assertIn("映射", result.issue_text)
+
+    def test_build_runtime_visibility_summary_uses_file_mapping_labels(self) -> None:
+        snapshot = ReplayRuntimeSnapshot(
+            state=ReplayState.RUNNING,
+            current_ts_ns=1_000_000,
+            total_ts_ns=2_000_000,
+            launch_source=ReplayLaunchSource.SCENARIO_BOUND,
+        )
+        snapshot.adapter_health["mock0"] = AdapterHealth(online=True, detail="ok", per_channel={0: True})
+        bindings = [
+            {
+                "trace_file_id": "trace-a",
+                "source_channel": 0,
+                "source_bus_type": "CANFD",
+                "adapter_id": "mock0",
+                "logical_channel": 0,
+                "physical_channel": 0,
+                "bus_type": "CANFD",
+            }
+        ]
+        trace_lookup = {
+            "trace-a": TraceFileRecord(
+                trace_id="trace-a",
+                name="can.asc",
+                original_path="/tmp/can.asc",
+                library_path="/tmp/cache.asc",
+                format="asc",
+                imported_at="now",
+            )
+        }
+
+        summary = _build_runtime_visibility_summary(snapshot, bindings, trace_lookup)
+
+        self.assertIn("can.asc | CH0 | CANFD", summary.device_text)
 
 
 if __name__ == "__main__":

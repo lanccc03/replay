@@ -167,6 +167,9 @@ class DeviceChannelBinding:
     physical_channel: int
     bus_type: BusType
     device_type: str
+    trace_file_id: str = ""
+    source_channel: Optional[int] = None
+    source_bus_type: Optional[BusType] = None
     device_index: int = 0
     sdk_root: str = "zlgcan_python_251211"
     nominal_baud: int = 500000
@@ -188,6 +191,9 @@ class DeviceChannelBinding:
             tx_echo=self.tx_echo,
             extra=dict(self.network),
         )
+
+    def uses_trace_source(self) -> bool:
+        return bool(self.trace_file_id) and self.source_channel is not None and self.source_bus_type is not None
 
 
 @dataclass
@@ -395,6 +401,17 @@ class ScenarioSpec:
                 physical_channel=int(item["physical_channel"]),
                 bus_type=parse_bus(item["bus_type"]),
                 device_type=item["device_type"],
+                trace_file_id=item.get("trace_file_id", ""),
+                source_channel=(
+                    int(item["source_channel"])
+                    if item.get("source_channel") is not None and item.get("source_channel") != ""
+                    else None
+                ),
+                source_bus_type=(
+                    parse_bus(item["source_bus_type"])
+                    if item.get("source_bus_type") not in (None, "")
+                    else None
+                ),
                 device_index=int(item.get("device_index", 0)),
                 sdk_root=item.get("sdk_root", "zlgcan_python_251211"),
                 nominal_baud=int(item.get("nominal_baud", 500000)),

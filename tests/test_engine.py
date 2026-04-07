@@ -509,6 +509,45 @@ class ReplayEngineTests(unittest.TestCase):
         self._run_engine_to_completion(scenario, [], {"mock-1": adapter}, timeout_s=0.1)
         self.assertEqual([], adapter.sent_frames)
 
+    def test_file_mapped_bindings_on_same_physical_channel_raise_even_when_configs_match(self):
+        adapter = MockDeviceAdapter("mock-1", channel_count=2)
+        scenario = ScenarioSpec(
+            scenario_id="s-file-map-conflict",
+            name="File map conflict",
+            bindings=[
+                DeviceChannelBinding(
+                    trace_file_id="trace-a",
+                    source_channel=0,
+                    source_bus_type=BusType.CANFD,
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CANFD,
+                    nominal_baud=500000,
+                    data_baud=2000000,
+                    device_type="MOCK",
+                ),
+                DeviceChannelBinding(
+                    trace_file_id="trace-b",
+                    source_channel=1,
+                    source_bus_type=BusType.CANFD,
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=1,
+                    physical_channel=0,
+                    bus_type=BusType.CANFD,
+                    nominal_baud=500000,
+                    data_baud=2000000,
+                    device_type="MOCK",
+                ),
+            ],
+        )
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, [], {"mock-1": adapter}, {})
+        with self.assertRaisesRegex(Exception, "文件映射占用|占用"):
+            engine.start()
+
     def test_frames_within_2ms_are_sent_in_one_batch(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
         scenario = ScenarioSpec(

@@ -45,6 +45,27 @@ LOG_LEVEL_OPTION_LABELS = {
 }
 LOG_LEVEL_OPTIONS = tuple(LOG_LEVEL_OPTION_LABELS[preset] for preset in LOG_LEVEL_PRESET_OPTIONS)
 LOG_LEVEL_DEFAULT_HINT = "仅影响之后新产生的日志，已有内容不会重新过滤"
+ZLG_DEVICE_TYPE_OPTIONS = (
+    "USBCANFD_100U",
+    "USBCANFD_200U",
+    "USBCANFD_400U",
+    "USBCANFD_800U",
+    "USBCANFD_MINI",
+    "CANFDNET_100U_TCP",
+    "CANFDNET_100U_UDP",
+    "CANFDNET_200U_TCP",
+    "CANFDNET_200U_UDP",
+    "CANFDNET_400U_TCP",
+    "CANFDNET_400U_UDP",
+    "CANFDNET_800U_TCP",
+    "CANFDNET_800U_UDP",
+)
+DRIVER_DEVICE_TYPE_OPTIONS = {
+    "zlg": ZLG_DEVICE_TYPE_OPTIONS,
+    "mock": ("MOCK",),
+    "tongxing": ("TC1014",),
+}
+LEGACY_ZLG_DEVICE_TYPES = frozenset({"USBCANFD"})
 
 
 @dataclass(frozen=True)
@@ -58,7 +79,7 @@ class ValidationIssue:
 class DraftValidationResult:
     normalized_payload: Optional[dict]
     errors: list[ValidationIssue]
-    warnings: list[str]
+    warnings: list[ValidationIssue]
 
 
 @dataclass(frozen=True)
@@ -66,7 +87,7 @@ class EditorFieldSpec:
     key: str
     label: str
     kind: str = "text"
-    options: tuple[str, ...] = ()
+    options: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +141,60 @@ def _display_text(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=True)
     return str(value)
+
+
+def _normalize_driver_name(value: Any) -> str:
+    return _display_text(value).strip().lower() or "zlg"
+
+
+def _binding_device_type_options(driver: Any) -> tuple[str, ...]:
+    return DRIVER_DEVICE_TYPE_OPTIONS.get(_normalize_driver_name(driver), ())
+
+
+def _binding_device_type_placeholder(driver: Any) -> str:
+    normalized_driver = _normalize_driver_name(driver)
+    if normalized_driver == "zlg":
+        return "请选择或填写具体型号，例如 USBCANFD_200U"
+    if normalized_driver == "tongxing":
+        return "请选择或填写设备子型号，例如 TC1014"
+    if normalized_driver == "mock":
+        return "可保留 MOCK 或按需要手工填写"
+    return "请选择或填写设备类型"
+
+
+def _parse_device_type_text(raw: Any, driver: Any) -> str:
+    text = _display_text(raw).strip()
+    if _normalize_driver_name(driver) == "zlg":
+        return text
+    return _require_text(text, "设备类型")
+
+
+def _binding_warning_subject(binding: dict) -> str:
+    adapter_id = _display_text(binding.get("adapter_id", "")).strip() or "未命名适配器"
+    logical_channel = _display_text(binding.get("logical_channel", "")).strip()
+    if logical_channel:
+        return f"{adapter_id} / LC{logical_channel}"
+    return adapter_id
+
+
+def _binding_device_type_warning(binding: dict, index: int) -> Optional[ValidationIssue]:
+    if _normalize_driver_name(binding.get("driver", "zlg")) != "zlg":
+        return None
+    device_type = _display_text(binding.get("device_type", "")).strip()
+    subject = _binding_warning_subject(binding)
+    if not device_type:
+        return ValidationIssue(
+            "bindings",
+            f"bindings[{index}].device_type",
+            f"{subject} 尚未选择具体 ZLG 设备类型，探测物理通道和实际运行前需要补全。",
+        )
+    if device_type.upper() in LEGACY_ZLG_DEVICE_TYPES:
+        return ValidationIssue(
+            "bindings",
+            f"bindings[{index}].device_type",
+            f"{subject} 仍使用旧写法 USBCANFD，建议改成具体型号后再探测或运行。",
+        )
+    return None
 
 
 def _format_table_value(value: Any) -> str:
@@ -329,12 +404,23 @@ def _assess_scenario_launch(payload: Optional[dict], selected_trace_ids: list[st
         )
 
     issues: list[str] = []
+    trace_bound_bindings = [binding for binding in scenario.bindings if binding.uses_trace_source()]
+    trace_bound_trace_ids = {binding.trace_file_id for binding in trace_bound_bindings}
     if scenario.trace_file_ids:
         source_text = "启动来源：将使用场景内已绑定文件启动。"
         detail_text = "场景已绑定回放文件。"
+        if trace_bound_bindings:
+            missing_trace_mappings = sorted(set(scenario.trace_file_ids) - trace_bound_trace_ids)
+            if missing_trace_mappings:
+                issues.append("已勾选文件尚未完成文件映射。")
     elif selected_trace_ids:
-        source_text = "启动来源：将使用主窗口当前选中的文件启动。"
-        detail_text = "将回退到主窗口当前选中的文件。"
+        if trace_bound_bindings:
+            source_text = "启动来源：文件映射场景必须使用场景内绑定文件。"
+            detail_text = "当前存在文件映射，但场景未勾选回放文件。"
+            issues.append("文件映射场景不能回退到主窗口选中文件。")
+        else:
+            source_text = "启动来源：将使用主窗口当前选中的文件启动。"
+            detail_text = "将回退到主窗口当前选中的文件。"
     else:
         source_text = "启动来源：未找到可回放文件。"
         detail_text = "请在场景中绑定回放文件，或在左侧“回放文件”页签中至少选中一个文件。"
@@ -421,9 +507,10 @@ def _build_scenario_business_summary(
     else:
         trace_text = "回放文件：场景未绑定文件"
 
+    label_map = _binding_label_map(scenario.bindings, trace_lookup)
     if scenario.bindings:
         binding_text = "通道绑定：" + "；".join(
-            f"LC{binding.logical_channel} -> {binding.adapter_id}/PC{binding.physical_channel} {binding.bus_type.value}"
+            f"{_binding_source_label(binding, trace_lookup)} -> {binding.adapter_id}/PC{binding.physical_channel} {binding.bus_type.value}"
             for binding in scenario.bindings
         )
     else:
@@ -431,11 +518,14 @@ def _build_scenario_business_summary(
 
     database_map = {binding.logical_channel: Path(binding.path).name or binding.path for binding in scenario.database_bindings}
     database_parts = [
-        f"LC{binding.logical_channel} -> {database_map.get(binding.logical_channel, '未配置数据库')}"
+        f"{_logical_channel_label(binding.logical_channel, label_map)} -> {database_map.get(binding.logical_channel, '未配置数据库')}"
         for binding in scenario.bindings
     ]
     orphan_channels = sorted(set(database_map) - {binding.logical_channel for binding in scenario.bindings})
-    database_parts.extend(f"LC{channel} -> {database_map[channel]}（未绑定通道）" for channel in orphan_channels)
+    database_parts.extend(
+        f"{_logical_channel_label(channel, label_map)} -> {database_map[channel]}"
+        for channel in orphan_channels
+    )
     if not database_parts:
         database_text = "数据库绑定：未配置数据库"
     else:
@@ -521,7 +611,12 @@ def _format_launch_source(source: Optional[ReplayLaunchSource]) -> str:
     return "未开始回放"
 
 
-def _build_device_status_text(snapshot: ReplayRuntimeSnapshot, bindings: list[Any]) -> str:
+def _build_device_status_text(
+    snapshot: ReplayRuntimeSnapshot,
+    bindings: list[Any],
+    trace_lookup: Optional[dict[str, TraceFileRecord]] = None,
+) -> str:
+    label_map = _binding_label_map(bindings, trace_lookup or {})
     adapter_ids: list[str] = []
     for binding in bindings:
         adapter_id = _display_text(binding.get("adapter_id", "")).strip()
@@ -546,7 +641,7 @@ def _build_device_status_text(snapshot: ReplayRuntimeSnapshot, bindings: list[An
             channel_online = health.per_channel.get(int(physical_channel)) if physical_channel is not None else None
             if channel_online is None:
                 continue
-            channel_parts.append(f"LC{logical_channel} {'正常' if channel_online else '离线'}")
+            channel_parts.append(f"{_logical_channel_label(logical_channel, label_map)} {'正常' if channel_online else '离线'}")
         state_text = "在线" if health.online else "离线"
         detail_text = f"，{' / '.join(channel_parts)}" if channel_parts else (f"（{health.detail}）" if health.detail else "")
         parts.append(f"{adapter_id} {state_text}{detail_text}")
@@ -556,6 +651,7 @@ def _build_device_status_text(snapshot: ReplayRuntimeSnapshot, bindings: list[An
 def _build_runtime_visibility_summary(
     snapshot: ReplayRuntimeSnapshot,
     bindings: list[Any],
+    trace_lookup: Optional[dict[str, TraceFileRecord]] = None,
 ) -> RuntimeVisibilitySummary:
     total_ns = max(snapshot.total_ts_ns, 0)
     progress = 0.0
@@ -569,34 +665,104 @@ def _build_runtime_visibility_summary(
     )
     source_name = snapshot.current_source_file or "未开始"
     source_text = f"当前来源：{source_name}"
-    device_text = _build_device_status_text(snapshot, bindings)
+    device_text = _build_device_status_text(snapshot, bindings, trace_lookup)
     launch_text = f"启动来源：{_format_launch_source(snapshot.launch_source)}"
     return RuntimeVisibilitySummary(progress_text, source_text, device_text, launch_text)
 
 
-def _binding_summary(item: dict) -> str:
+def _parse_optional_int_text(raw: Any) -> Optional[int]:
+    text = _display_text(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text, 0)
+    except ValueError:
+        return None
+
+
+def _binding_uses_trace_source(item: dict | Any) -> bool:
+    if hasattr(item, "trace_file_id"):
+        return bool(getattr(item, "trace_file_id", "")) and getattr(item, "source_channel", None) is not None and getattr(
+            item, "source_bus_type", None
+        ) is not None
+    trace_file_id = _display_text(item.get("trace_file_id", "")).strip()
+    return bool(trace_file_id) and _parse_optional_int_text(item.get("source_channel")) is not None and bool(
+        _display_text(item.get("source_bus_type", "")).strip()
+    )
+
+
+def _trace_record_name(trace_id: str, trace_lookup: dict[str, TraceFileRecord]) -> str:
+    record = trace_lookup.get(trace_id)
+    if record is None:
+        return f"缺失文件({trace_id})"
+    return record.name
+
+
+def _binding_source_label(item: dict | Any, trace_lookup: dict[str, TraceFileRecord]) -> str:
+    if not _binding_uses_trace_source(item):
+        logical_channel = getattr(item, "logical_channel", None) if hasattr(item, "logical_channel") else item.get("logical_channel")
+        logical_text = _display_text(logical_channel).strip() or "?"
+        return f"LC{logical_text}（旧映射）"
+    if hasattr(item, "trace_file_id"):
+        trace_file_id = _display_text(getattr(item, "trace_file_id", "")).strip()
+        source_channel = getattr(item, "source_channel", None)
+        source_bus_type = getattr(item, "source_bus_type", None)
+        bus_text = source_bus_type.value if isinstance(source_bus_type, BusType) else _display_text(source_bus_type).strip().upper()
+    else:
+        trace_file_id = _display_text(item.get("trace_file_id", "")).strip()
+        source_channel = _parse_optional_int_text(item.get("source_channel"))
+        bus_text = _display_text(item.get("source_bus_type", "")).strip().upper()
+    return f"{_trace_record_name(trace_file_id, trace_lookup)} | CH{source_channel} | {bus_text or '?'}"
+
+
+def _binding_label_map(bindings: list[Any], trace_lookup: dict[str, TraceFileRecord]) -> dict[int, str]:
+    labels: dict[int, str] = {}
+    for binding in bindings:
+        logical_channel = getattr(binding, "logical_channel", None) if hasattr(binding, "logical_channel") else binding.get("logical_channel")
+        try:
+            channel_key = int(logical_channel)
+        except (TypeError, ValueError):
+            continue
+        labels[channel_key] = _binding_source_label(binding, trace_lookup)
+    return labels
+
+
+def _logical_channel_label(logical_channel: Any, label_map: dict[int, str]) -> str:
+    try:
+        channel_key = int(logical_channel)
+    except (TypeError, ValueError):
+        return f"LC{_display_text(logical_channel).strip() or '?'}（旧映射/缺失）"
+    return label_map.get(channel_key, f"LC{channel_key}（旧映射/缺失）")
+
+
+def _binding_summary(item: dict, trace_lookup: Optional[dict[str, TraceFileRecord]] = None) -> str:
     adapter_id = _display_text(item.get("adapter_id", "")).strip() or "未命名适配器"
     driver = _display_text(item.get("driver", "")).strip().lower() or "?"
-    logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     physical_channel = _display_text(item.get("physical_channel", "")).strip() or "?"
     bus_type = _display_text(item.get("bus_type", "")).strip().upper() or "?"
     device_type = _display_text(item.get("device_type", "")).strip() or "?"
+    if trace_lookup:
+        source_label = _binding_source_label(item, trace_lookup)
+        return f"{source_label} -> {adapter_id}/PC{physical_channel} | {driver} | {bus_type}/{device_type}"
+    logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     return f"{adapter_id} | {driver} | LC{logical_channel}->PC{physical_channel} | {bus_type}/{device_type}"
 
 
-def _database_binding_summary(item: dict) -> str:
+def _database_binding_summary(item: dict, label_map: Optional[dict[int, str]] = None) -> str:
     logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     path = _display_text(item.get("path", "")).strip() or "未选择文件"
     fmt = _display_text(item.get("format", "")).strip() or "dbc"
-    return f"LC{logical_channel} | {fmt} | {path}"
+    channel_text = _logical_channel_label(logical_channel, label_map or {}) if label_map else f"LC{logical_channel}"
+    return f"{channel_text} | {fmt} | {path}"
 
 
-def _signal_override_summary(item: dict) -> str:
+def _signal_override_summary(item: dict, label_map: Optional[dict[int, str]] = None) -> str:
     logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     message_id = _display_text(item.get("message_id_or_pgn", "")).strip() or "?"
     signal_name = _display_text(item.get("signal_name", "")).strip() or "未命名信号"
     value = _display_text(item.get("value", "")).strip() or "空值"
-    return f"LC{logical_channel} | {message_id} | {signal_name} = {value}"
+    channel_text = _logical_channel_label(logical_channel, label_map or {}) if label_map else f"LC{logical_channel}"
+    return f"{channel_text} | {message_id} | {signal_name} = {value}"
 
 
 def _frame_enable_status_text(enabled: bool) -> str:
@@ -607,7 +773,7 @@ def _frame_enable_rule_summary(rule: FrameEnableRule) -> str:
     return f"LC{rule.logical_channel} | {hex(rule.message_id)} | {_frame_enable_status_text(rule.enabled)}"
 
 
-def _diagnostic_target_summary(item: dict) -> str:
+def _diagnostic_target_summary(item: dict, label_map: Optional[dict[int, str]] = None) -> str:
     name = _display_text(item.get("name", "")).strip() or "未命名目标"
     transport = _display_text(item.get("transport", "")).strip().upper() or "?"
     if transport == DiagnosticTransport.DOIP.value:
@@ -617,7 +783,8 @@ def _diagnostic_target_summary(item: dict) -> str:
     logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     tx_id = _format_field_value(item.get("tx_id", ""), "hex-int") or "?"
     rx_id = _format_field_value(item.get("rx_id", ""), "hex-int") or "?"
-    return f"{name} | CAN | LC{logical_channel} | TX {tx_id} / RX {rx_id}"
+    channel_text = _logical_channel_label(logical_channel, label_map or {}) if label_map else f"LC{logical_channel}"
+    return f"{name} | CAN | {channel_text} | TX {tx_id} / RX {rx_id}"
 
 
 def _diagnostic_action_summary(item: dict) -> str:
@@ -628,23 +795,29 @@ def _diagnostic_action_summary(item: dict) -> str:
     return f"{ts_ns} ns | {target} | SID {sid} | {transport}"
 
 
-def _link_action_summary(item: dict) -> str:
+def _link_action_summary(item: dict, label_map: Optional[dict[int, str]] = None) -> str:
     ts_ns = _display_text(item.get("ts_ns", "")).strip() or "?"
     adapter_id = _display_text(item.get("adapter_id", "")).strip() or "未命名适配器"
     action = _display_text(item.get("action", "")).strip().upper() or "?"
     logical_channel = _display_text(item.get("logical_channel", "")).strip()
-    channel_text = f" | LC{logical_channel}" if logical_channel else ""
+    if logical_channel and label_map is not None:
+        channel_text = f" | {_logical_channel_label(logical_channel, label_map)}"
+    else:
+        channel_text = f" | LC{logical_channel}" if logical_channel else ""
     return f"{ts_ns} ns | {adapter_id} | {action}{channel_text}"
 
 
-def _new_binding_draft() -> dict:
+def _new_binding_draft(logical_channel: int = 0) -> dict:
     return {
+        "trace_file_id": "",
+        "source_channel": "",
+        "source_bus_type": "",
         "adapter_id": "zlg0",
         "driver": "zlg",
-        "logical_channel": "0",
-        "physical_channel": "0",
+        "logical_channel": str(logical_channel),
+        "physical_channel": str(logical_channel),
         "bus_type": "CANFD",
-        "device_type": "USBCANFD",
+        "device_type": "",
         "device_index": "0",
         "sdk_root": _default_sdk_root_for_driver("zlg"),
         "nominal_baud": "500000",
@@ -663,8 +836,11 @@ def _default_sdk_root_for_driver(driver: Any) -> str:
 
 
 def _binding_draft_from_item(item: dict) -> dict:
-    driver = _display_text(item.get("driver", "zlg")).lower() or "zlg"
+    driver = _normalize_driver_name(item.get("driver", "zlg"))
     return {
+        "trace_file_id": item.get("trace_file_id", ""),
+        "source_channel": _display_text(item.get("source_channel", "")),
+        "source_bus_type": _display_text(item.get("source_bus_type", "")).upper(),
         "adapter_id": item.get("adapter_id", ""),
         "driver": driver,
         "logical_channel": _display_text(item.get("logical_channel", 0)),
@@ -693,19 +869,38 @@ def _normalize_binding_item(item: dict, *, path_prefix: str = "bindings[0]") -> 
             default="zlg",
             normalize=str.lower,
         )
-        return {
-            "adapter_id": _require_text(item.get("adapter_id", ""), "适配器ID"),
-            "driver": driver,
-            "logical_channel": _parse_int_text(item.get("logical_channel", ""), "逻辑通道"),
-            "physical_channel": _parse_int_text(item.get("physical_channel", ""), "物理通道"),
-            "bus_type": _parse_choice_text(
+        trace_file_id = _display_text(item.get("trace_file_id", "")).strip()
+        source_channel_text = _display_text(item.get("source_channel", "")).strip()
+        source_bus_type_text = _display_text(item.get("source_bus_type", "")).strip().upper()
+        has_trace_source = bool(trace_file_id or source_channel_text or source_bus_type_text)
+        if has_trace_source:
+            trace_file_id = _require_text(trace_file_id, "文件")
+            source_channel = _parse_int_text(source_channel_text, "源通道")
+            source_bus_type = _parse_choice_text(source_bus_type_text, "源总线类型", BUS_OPTIONS, normalize=str.upper)
+        else:
+            source_channel = None
+            source_bus_type = None
+        bus_type = (
+            source_bus_type
+            if source_bus_type is not None
+            else _parse_choice_text(
                 item.get("bus_type", "CANFD"),
                 "总线类型",
                 BUS_OPTIONS,
                 default="CANFD",
                 normalize=str.upper,
-            ),
-            "device_type": _require_text(item.get("device_type", ""), "设备类型"),
+            )
+        )
+        return {
+            "trace_file_id": trace_file_id,
+            "source_channel": source_channel,
+            "source_bus_type": source_bus_type,
+            "adapter_id": _require_text(item.get("adapter_id", ""), "适配器ID"),
+            "driver": driver,
+            "logical_channel": _parse_int_text(item.get("logical_channel", ""), "逻辑通道"),
+            "physical_channel": _parse_int_text(item.get("physical_channel", ""), "物理通道"),
+            "bus_type": bus_type,
+            "device_type": _parse_device_type_text(item.get("device_type", ""), driver),
             "device_index": _parse_int_text(item.get("device_index", ""), "设备索引", allow_empty=True, default=0),
             "sdk_root": _display_text(item.get("sdk_root", "")).strip() or _default_sdk_root_for_driver(driver),
             "nominal_baud": _parse_int_text(item.get("nominal_baud", ""), "仲裁波特率", allow_empty=True, default=500000),
@@ -738,13 +933,31 @@ def _validate_binding_draft(item: dict, index: int) -> tuple[Optional[dict], lis
         lambda: _parse_choice_text(item.get("driver", "zlg"), "驱动", DRIVER_OPTIONS, default="zlg", normalize=str.lower),
     )
     driver = normalized.get("driver", "zlg")
+    trace_file_id = _display_text(item.get("trace_file_id", "")).strip()
+    source_channel_text = _display_text(item.get("source_channel", "")).strip()
+    source_bus_type_text = _display_text(item.get("source_bus_type", "")).strip().upper()
+    has_trace_source = bool(trace_file_id or source_channel_text or source_bus_type_text)
+    if has_trace_source:
+        capture("trace_file_id", lambda: _require_text(trace_file_id, "文件"))
+        capture("source_channel", lambda: _parse_int_text(source_channel_text, "源通道"))
+        capture(
+            "source_bus_type",
+            lambda: _parse_choice_text(source_bus_type_text, "源总线类型", BUS_OPTIONS, normalize=str.upper),
+        )
+    else:
+        normalized["trace_file_id"] = ""
+        normalized["source_channel"] = None
+        normalized["source_bus_type"] = None
     capture("logical_channel", lambda: _parse_int_text(item.get("logical_channel", ""), "逻辑通道"))
     capture("physical_channel", lambda: _parse_int_text(item.get("physical_channel", ""), "物理通道"))
-    capture(
-        "bus_type",
-        lambda: _parse_choice_text(item.get("bus_type", "CANFD"), "总线类型", BUS_OPTIONS, default="CANFD", normalize=str.upper),
-    )
-    capture("device_type", lambda: _require_text(item.get("device_type", ""), "设备类型"))
+    if has_trace_source:
+        normalized["bus_type"] = normalized.get("source_bus_type")
+    else:
+        capture(
+            "bus_type",
+            lambda: _parse_choice_text(item.get("bus_type", "CANFD"), "总线类型", BUS_OPTIONS, default="CANFD", normalize=str.upper),
+        )
+    capture("device_type", lambda: _parse_device_type_text(item.get("device_type", ""), driver))
     capture("device_index", lambda: _parse_int_text(item.get("device_index", ""), "设备索引", allow_empty=True, default=0))
     normalized["sdk_root"] = _display_text(item.get("sdk_root", "")).strip() or _default_sdk_root_for_driver(driver)
     capture(
@@ -956,7 +1169,12 @@ def build_main_window(app_logic: ReplayApplication):
         def _create_input(self, field: EditorFieldSpec) -> QWidget:
             if field.kind == "combo":
                 widget = QComboBox()
-                widget.addItems(list(field.options))
+                for option in field.options:
+                    if isinstance(option, tuple) and len(option) >= 2:
+                        label, value = option[0], option[1]
+                    else:
+                        label = value = option
+                    widget.addItem(_display_text(label), value)
                 return widget
             if field.kind == "bool":
                 return QCheckBox("启用")
@@ -971,10 +1189,19 @@ def build_main_window(app_logic: ReplayApplication):
                 widget = self._inputs[field.key]
                 value = payload.get(field.key)
                 if isinstance(widget, QComboBox):
-                    text = _format_field_value(value, field.kind)
-                    if text and widget.findText(text) == -1:
-                        widget.addItem(text)
-                    widget.setCurrentText(text)
+                    matched_index = -1
+                    for index in range(widget.count()):
+                        option_value = widget.itemData(index, USER_ROLE)
+                        if option_value == value or _display_text(option_value) == _display_text(value):
+                            matched_index = index
+                            break
+                    if matched_index == -1:
+                        text = _format_field_value(value, field.kind)
+                        if text:
+                            widget.addItem(text, value)
+                            matched_index = widget.count() - 1
+                    if matched_index >= 0:
+                        widget.setCurrentIndex(matched_index)
                     continue
                 if isinstance(widget, QCheckBox):
                     widget.setChecked(bool(value))
@@ -989,7 +1216,8 @@ def build_main_window(app_logic: ReplayApplication):
             for field in self._fields:
                 widget = self._inputs[field.key]
                 if isinstance(widget, QComboBox):
-                    payload[field.key] = widget.currentText()
+                    value = widget.currentData(USER_ROLE)
+                    payload[field.key] = widget.currentText() if value is None else value
                 elif isinstance(widget, QCheckBox):
                     payload[field.key] = widget.isChecked()
                 elif isinstance(widget, QPlainTextEdit):
@@ -1031,7 +1259,7 @@ def build_main_window(app_logic: ReplayApplication):
             self._last_saved_payload: Optional[dict] = None
             self._last_valid_payload: Optional[dict] = None
             self._validation_errors: list[ValidationIssue] = []
-            self._validation_warnings: list[str] = []
+            self._validation_warnings: list[ValidationIssue] = []
             self._feedback_message = ""
             self._feedback_tone = "muted"
             self._is_dirty = False
@@ -1303,17 +1531,22 @@ def build_main_window(app_logic: ReplayApplication):
             parent_layout.addWidget(box)
 
         def _build_binding_section(self, parent_layout: QVBoxLayout) -> None:
-            box = QGroupBox("通道绑定")
-            self._register_section("bindings", box, "通道绑定")
+            box = QGroupBox("文件映射")
+            self._register_section("bindings", box, "文件映射")
             layout = QVBoxLayout(box)
 
-            hint = QLabel("左侧查看绑定摘要，右侧编辑当前选中的通道绑定。")
+            hint = QLabel("左侧查看文件映射摘要，右侧配置当前文件的映射参数。")
             hint.setWordWrap(True)
             hint.setProperty("role", "sectionHint")
             layout.addWidget(hint)
 
+            self.binding_warning_label = QLabel()
+            self.binding_warning_label.setWordWrap(True)
+            self.binding_warning_label.hide()
+            layout.addWidget(self.binding_warning_label)
+
             action_row = QHBoxLayout()
-            self.add_binding_button = QPushButton("新增绑定")
+            self.add_binding_button = QPushButton("新增文件映射")
             self.add_binding_button.clicked.connect(self._add_binding)
             self._set_button_variant(self.add_binding_button, "secondary")
             action_row.addWidget(self.add_binding_button)
@@ -1343,7 +1576,7 @@ def build_main_window(app_logic: ReplayApplication):
             editor_layout.setContentsMargins(14, 14, 14, 14)
             editor_layout.setSpacing(10)
 
-            self.binding_editor_hint = QLabel("选择一个绑定后即可编辑；新增时会自动创建默认绑定。")
+            self.binding_editor_hint = QLabel("选择一个文件映射后即可编辑；新增时会优先选中尚未映射的场景文件。")
             self.binding_editor_hint.setWordWrap(True)
             self.binding_editor_hint.setProperty("tone", "muted")
             editor_layout.addWidget(self.binding_editor_hint)
@@ -1353,57 +1586,65 @@ def build_main_window(app_logic: ReplayApplication):
             self.binding_editor_grid.setVerticalSpacing(10)
             editor_layout.addLayout(self.binding_editor_grid)
 
+            self.binding_trace_file_combo = QComboBox()
+            self._add_binding_field("trace_file_id", "文件", self.binding_trace_file_combo, 0, 0)
+
+            self.binding_source_combo = QComboBox()
+            self._add_binding_field("source_selector", "源项", self.binding_source_combo, 0, 1)
+
             self.binding_adapter_id_edit = QLineEdit()
-            self._add_binding_field("adapter_id", "适配器ID", self.binding_adapter_id_edit, 0, 0)
+            self._add_binding_field("adapter_id", "适配器ID", self.binding_adapter_id_edit, 1, 0)
 
             self.binding_driver_combo = QComboBox()
             self.binding_driver_combo.addItems(list(DRIVER_OPTIONS))
-            self._add_binding_field("driver", "驱动", self.binding_driver_combo, 0, 1)
+            self._add_binding_field("driver", "驱动", self.binding_driver_combo, 1, 1)
 
             self.binding_logical_channel_edit = QLineEdit()
-            self._add_binding_field("logical_channel", "逻辑通道", self.binding_logical_channel_edit, 1, 0)
+            self.binding_logical_channel_edit.setReadOnly(True)
+            self._add_binding_field("logical_channel", "托管逻辑通道", self.binding_logical_channel_edit, 2, 0)
 
             self.binding_physical_channel_edit = QLineEdit()
-            self._add_binding_field("physical_channel", "物理通道", self.binding_physical_channel_edit, 1, 1)
+            self._add_binding_field("physical_channel", "物理通道", self.binding_physical_channel_edit, 2, 1)
 
-            self.binding_bus_type_combo = QComboBox()
-            self.binding_bus_type_combo.addItems(list(BUS_OPTIONS))
-            self._add_binding_field("bus_type", "总线类型", self.binding_bus_type_combo, 2, 0)
+            self.binding_bus_type_edit = QLineEdit()
+            self.binding_bus_type_edit.setReadOnly(True)
+            self._add_binding_field("bus_type", "总线类型", self.binding_bus_type_edit, 3, 0)
 
-            self.binding_device_type_edit = QLineEdit()
-            self._add_binding_field("device_type", "设备类型", self.binding_device_type_edit, 2, 1)
+            self.binding_device_type_combo = QComboBox()
+            self.binding_device_type_combo.setEditable(True)
+            self._add_binding_field("device_type", "设备类型", self.binding_device_type_combo, 3, 1)
 
             self.binding_device_index_edit = QLineEdit()
-            self._add_binding_field("device_index", "设备索引", self.binding_device_index_edit, 3, 0)
+            self._add_binding_field("device_index", "设备索引", self.binding_device_index_edit, 4, 0)
 
             self.binding_sdk_root_edit = QLineEdit()
-            self._add_binding_field("sdk_root", "SDK路径", self.binding_sdk_root_edit, 3, 1)
+            self._add_binding_field("sdk_root", "SDK路径", self.binding_sdk_root_edit, 4, 1)
 
             self.binding_nominal_baud_edit = QLineEdit()
-            self._add_binding_field("nominal_baud", "仲裁波特率", self.binding_nominal_baud_edit, 4, 0)
+            self._add_binding_field("nominal_baud", "仲裁波特率", self.binding_nominal_baud_edit, 5, 0)
 
             self.binding_data_baud_edit = QLineEdit()
-            self._add_binding_field("data_baud", "数据波特率", self.binding_data_baud_edit, 4, 1)
+            self._add_binding_field("data_baud", "数据波特率", self.binding_data_baud_edit, 5, 1)
 
             self.binding_resistance_checkbox = QCheckBox("开启")
-            self._add_binding_field("resistance_enabled", "终端电阻", self.binding_resistance_checkbox, 5, 0)
+            self._add_binding_field("resistance_enabled", "终端电阻", self.binding_resistance_checkbox, 6, 0)
 
             self.binding_listen_only_checkbox = QCheckBox("开启")
-            self._add_binding_field("listen_only", "只听", self.binding_listen_only_checkbox, 5, 1)
+            self._add_binding_field("listen_only", "只听", self.binding_listen_only_checkbox, 6, 1)
 
             self.binding_tx_echo_checkbox = QCheckBox("开启")
-            self._add_binding_field("tx_echo", "回显", self.binding_tx_echo_checkbox, 6, 0)
+            self._add_binding_field("tx_echo", "回显", self.binding_tx_echo_checkbox, 7, 0)
 
             self.binding_merge_receive_checkbox = QCheckBox("开启")
-            self._add_binding_field("merge_receive", "合并接收", self.binding_merge_receive_checkbox, 6, 1)
+            self._add_binding_field("merge_receive", "合并接收", self.binding_merge_receive_checkbox, 7, 1)
 
             self.binding_network_editor = QPlainTextEdit()
             self.binding_network_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self._add_binding_field("network", "网络参数(JSON)", self.binding_network_editor, 7, 0, column_span=2)
+            self._add_binding_field("network", "网络参数(JSON)", self.binding_network_editor, 8, 0, column_span=2)
 
             self.binding_metadata_editor = QPlainTextEdit()
             self.binding_metadata_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self._add_binding_field("metadata", "元数据(JSON)", self.binding_metadata_editor, 8, 0, column_span=2)
+            self._add_binding_field("metadata", "元数据(JSON)", self.binding_metadata_editor, 9, 0, column_span=2)
 
             content_layout.addWidget(self.binding_editor_frame, 2)
             layout.addWidget(content)
@@ -1722,6 +1963,12 @@ def build_main_window(app_logic: ReplayApplication):
             self._is_dirty = False
             self._raw_dirty = False
             self._suspend_updates = False
+            result = self._validate_current_draft()
+            self._validation_errors = result.errors
+            self._validation_warnings = result.warnings
+            if result.warnings:
+                self._feedback_message = f"已加载场景；仍有 {len(result.warnings)} 个提示需要关注。"
+                self._feedback_tone = "warn"
             self._on_payload_changed(_clone_jsonable(normalized))
             self._refresh_json_preview()
             self._apply_validation_visuals()
@@ -1731,6 +1978,7 @@ def build_main_window(app_logic: ReplayApplication):
             self._suspend_updates = True
             self._populate_trace_choices(set(self._checked_trace_ids()))
             self._suspend_updates = False
+            self._handle_trace_selection_changed()
             self._run_live_validation()
 
         def export_scenario(self, use_selected_trace_fallback: bool = False) -> ScenarioSpec:
@@ -1788,13 +2036,182 @@ def build_main_window(app_logic: ReplayApplication):
         def _handle_user_edit(self, *_args) -> None:
             if self._suspend_updates:
                 return
+            if self.sender() is self.scenario_trace_list:
+                self._handle_trace_selection_changed()
             self._mark_dirty_and_schedule_validation()
 
         def _handle_metadata_changed(self) -> None:
             self._sync_text_edit_height(self.metadata_editor, min_lines=4)
             self._handle_user_edit()
 
+        def _handle_trace_selection_changed(self) -> None:
+            index = self.binding_list.currentRow()
+            if 0 <= index < len(self._draft_bindings):
+                self._draft_bindings[index] = self._coerce_binding_draft(self._draft_bindings[index])
+            self._refresh_binding_list(select_index=index if index >= 0 else None)
+            self._refresh_all_collection_lists()
+
+        def _binding_trace_lookup(self) -> dict[str, TraceFileRecord]:
+            return {record.trace_id: record for record in self.app_logic.list_traces()}
+
+        def _binding_trace_source_summaries(self, trace_id: str) -> list[dict]:
+            if not trace_id:
+                return []
+            try:
+                return self.app_logic.get_trace_source_summaries(trace_id)
+            except Exception:
+                return []
+
+        def _next_binding_logical_channel(self) -> int:
+            existing_channels = {
+                _parse_optional_int_text(binding.get("logical_channel"))
+                for binding in self._draft_bindings
+            }
+            candidate = 0
+            while candidate in existing_channels:
+                candidate += 1
+            return candidate
+
+        def _next_unmapped_trace_id(self) -> str:
+            mapped_trace_ids = {
+                _display_text(binding.get("trace_file_id", "")).strip()
+                for binding in self._draft_bindings
+                if _display_text(binding.get("trace_file_id", "")).strip()
+            }
+            for trace_id in self._checked_trace_ids():
+                if trace_id not in mapped_trace_ids:
+                    return trace_id
+            return ""
+
+        def _current_trace_file_id(self) -> str:
+            value = self.binding_trace_file_combo.currentData(USER_ROLE)
+            if value is None:
+                value = self.binding_trace_file_combo.currentText()
+            return _display_text(value).strip()
+
+        def _current_source_summary(self) -> Optional[dict]:
+            value = self.binding_source_combo.currentData(USER_ROLE)
+            if isinstance(value, dict):
+                return dict(value)
+            return None
+
+        def _coerce_binding_draft(self, payload: dict) -> dict:
+            draft = dict(payload)
+            trace_file_id = _display_text(draft.get("trace_file_id", "")).strip()
+            draft["trace_file_id"] = trace_file_id
+            source_channel = _display_text(draft.get("source_channel", "")).strip()
+            source_bus_type = _display_text(draft.get("source_bus_type", "")).strip().upper()
+            if not trace_file_id:
+                draft["source_channel"] = ""
+                draft["source_bus_type"] = ""
+                return draft
+            summaries = self._binding_trace_source_summaries(trace_file_id)
+            selected_summary = next(
+                (
+                    summary
+                    for summary in summaries
+                    if str(summary.get("source_channel")) == source_channel
+                    and _display_text(summary.get("bus_type", "")).strip().upper() == source_bus_type
+                ),
+                None,
+            )
+            if selected_summary is None and summaries:
+                selected_summary = summaries[0]
+            if selected_summary is not None:
+                draft["source_channel"] = str(selected_summary["source_channel"])
+                draft["source_bus_type"] = _display_text(selected_summary["bus_type"]).strip().upper()
+                draft["bus_type"] = draft["source_bus_type"]
+            elif source_bus_type:
+                draft["bus_type"] = source_bus_type
+            return draft
+
+        def _populate_binding_trace_file_options(self, selected_trace_id: str) -> None:
+            trace_lookup = self._binding_trace_lookup()
+            selected_ids = self._checked_trace_ids()
+            if selected_trace_id and selected_trace_id not in selected_ids:
+                selected_ids.append(selected_trace_id)
+            self.binding_trace_file_combo.blockSignals(True)
+            self.binding_trace_file_combo.clear()
+            for trace_id in selected_ids:
+                label = _trace_record_name(trace_id, trace_lookup)
+                self.binding_trace_file_combo.addItem(label)
+                self.binding_trace_file_combo.setItemData(self.binding_trace_file_combo.count() - 1, trace_id, USER_ROLE)
+            if self.binding_trace_file_combo.count() == 0:
+                self.binding_trace_file_combo.addItem("请先勾选场景文件")
+                self.binding_trace_file_combo.setItemData(0, "", USER_ROLE)
+            if selected_trace_id:
+                index = self.binding_trace_file_combo.findData(selected_trace_id, USER_ROLE)
+                if index >= 0:
+                    self.binding_trace_file_combo.setCurrentIndex(index)
+            self.binding_trace_file_combo.blockSignals(False)
+
+        def _populate_binding_source_options(
+            self,
+            trace_file_id: str,
+            source_channel: str,
+            source_bus_type: str,
+        ) -> None:
+            summaries = self._binding_trace_source_summaries(trace_file_id)
+            self.binding_source_combo.blockSignals(True)
+            self.binding_source_combo.clear()
+            selected_index = -1
+            for summary in summaries:
+                self.binding_source_combo.addItem(_display_text(summary.get("label", "")))
+                self.binding_source_combo.setItemData(self.binding_source_combo.count() - 1, summary, USER_ROLE)
+                if str(summary.get("source_channel")) == source_channel and _display_text(summary.get("bus_type", "")).strip().upper() == source_bus_type:
+                    selected_index = self.binding_source_combo.count() - 1
+            if selected_index < 0 and trace_file_id and source_channel and source_bus_type:
+                legacy_summary = {
+                    "source_channel": source_channel,
+                    "bus_type": source_bus_type,
+                    "frame_count": 0,
+                    "label": f"CH{source_channel} | {source_bus_type} | 旧映射/缺失",
+                }
+                self.binding_source_combo.addItem(legacy_summary["label"])
+                self.binding_source_combo.setItemData(self.binding_source_combo.count() - 1, legacy_summary, USER_ROLE)
+                selected_index = self.binding_source_combo.count() - 1
+            if self.binding_source_combo.count() == 0:
+                self.binding_source_combo.addItem("当前文件未识别到可映射源项")
+                self.binding_source_combo.setItemData(0, None, USER_ROLE)
+            if selected_index >= 0:
+                self.binding_source_combo.setCurrentIndex(selected_index)
+            elif self.binding_source_combo.count() > 0:
+                self.binding_source_combo.setCurrentIndex(0)
+            self.binding_source_combo.blockSignals(False)
+
+        def _populate_binding_driver_options(self, selected_driver: str) -> None:
+            self.binding_driver_combo.blockSignals(True)
+            self.binding_driver_combo.clear()
+            self.binding_driver_combo.addItems(list(DRIVER_OPTIONS))
+            normalized_driver = _normalize_driver_name(selected_driver)
+            index = self.binding_driver_combo.findText(normalized_driver)
+            if index >= 0:
+                self.binding_driver_combo.setCurrentIndex(index)
+            self.binding_driver_combo.blockSignals(False)
+
+        def _populate_binding_device_type_options(self, driver: Any, current_value: str) -> None:
+            normalized_driver = _normalize_driver_name(driver)
+            self.binding_device_type_combo.blockSignals(True)
+            self.binding_device_type_combo.clear()
+            for value in _binding_device_type_options(normalized_driver):
+                self.binding_device_type_combo.addItem(value)
+            self.binding_device_type_combo.setEditText(_display_text(current_value).strip())
+            line_edit = self.binding_device_type_combo.lineEdit()
+            if line_edit is not None:
+                line_edit.setPlaceholderText(_binding_device_type_placeholder(normalized_driver))
+            self.binding_device_type_combo.setToolTip(_binding_device_type_placeholder(normalized_driver))
+            self.binding_device_type_combo.blockSignals(False)
+
         def _connect_binding_widget(self, widget: QWidget) -> None:
+            if widget is self.binding_trace_file_combo:
+                self.binding_trace_file_combo.currentIndexChanged.connect(self._handle_binding_trace_file_changed)
+                return
+            if widget is self.binding_source_combo:
+                self.binding_source_combo.currentIndexChanged.connect(self._handle_binding_source_changed)
+                return
+            if getattr(self, "binding_driver_combo", None) is widget:
+                self.binding_driver_combo.currentTextChanged.connect(self._handle_binding_driver_changed)
+                return
             if isinstance(widget, QLineEdit):
                 widget.textChanged.connect(self._binding_input_changed)
                 return
@@ -1815,21 +2232,87 @@ def build_main_window(app_logic: ReplayApplication):
         def _binding_input_changed(self, *_args) -> None:
             if self._suspend_updates:
                 return
+            index = self._sync_selected_binding_draft()
+            if index is None:
+                return
+            self._refresh_binding_list(select_index=index)
+            self._refresh_all_collection_lists()
+            self._mark_dirty_and_schedule_validation()
+
+        def _sync_selected_binding_draft(self) -> Optional[int]:
+            index = self.binding_list.currentRow()
+            if index < 0 or index >= len(self._draft_bindings):
+                return None
+            self._draft_bindings[index] = self._coerce_binding_draft(self._selected_binding_payload_from_inputs())
+            return index
+
+        def _handle_binding_trace_file_changed(self, *_args) -> None:
+            if self._suspend_updates:
+                return
             index = self.binding_list.currentRow()
             if index < 0 or index >= len(self._draft_bindings):
                 return
-            self._draft_bindings[index] = self._selected_binding_payload_from_inputs()
+            payload = dict(self._draft_bindings[index])
+            payload["trace_file_id"] = self._current_trace_file_id()
+            payload["source_channel"] = ""
+            payload["source_bus_type"] = ""
+            self._draft_bindings[index] = self._coerce_binding_draft(payload)
             self._refresh_binding_list(select_index=index)
+            self._refresh_all_collection_lists()
+            self._mark_dirty_and_schedule_validation()
+
+        def _handle_binding_source_changed(self, *_args) -> None:
+            if self._suspend_updates:
+                return
+            index = self.binding_list.currentRow()
+            if index < 0 or index >= len(self._draft_bindings):
+                return
+            payload = dict(self._draft_bindings[index])
+            source_summary = self._current_source_summary() or {}
+            payload["trace_file_id"] = self._current_trace_file_id()
+            payload["source_channel"] = _display_text(source_summary.get("source_channel", ""))
+            payload["source_bus_type"] = _display_text(source_summary.get("bus_type", "")).strip().upper()
+            self._draft_bindings[index] = self._coerce_binding_draft(payload)
+            self._refresh_binding_list(select_index=index)
+            self._refresh_all_collection_lists()
+            self._mark_dirty_and_schedule_validation()
+
+        def _handle_binding_driver_changed(self, *_args) -> None:
+            if self._suspend_updates:
+                return
+            index = self.binding_list.currentRow()
+            if index < 0 or index >= len(self._draft_bindings):
+                return
+            payload = dict(self._draft_bindings[index])
+            previous_driver = _normalize_driver_name(payload.get("driver", "zlg"))
+            new_driver = _normalize_driver_name(self.binding_driver_combo.currentText())
+            payload["driver"] = new_driver
+            current_sdk_root = _display_text(self.binding_sdk_root_edit.text()).strip()
+            if not current_sdk_root or current_sdk_root == _default_sdk_root_for_driver(previous_driver):
+                payload["sdk_root"] = _default_sdk_root_for_driver(new_driver)
+            current_device_type = _display_text(self.binding_device_type_combo.currentText()).strip()
+            payload["device_type"] = current_device_type
+            self._draft_bindings[index] = self._coerce_binding_draft(payload)
+            self._suspend_updates = True
+            self._populate_binding_device_type_options(new_driver, current_device_type)
+            self.binding_sdk_root_edit.setText(_display_text(payload.get("sdk_root", "")))
+            self._suspend_updates = False
+            self._refresh_binding_list(select_index=index)
+            self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation()
 
         def _selected_binding_payload_from_inputs(self) -> dict:
+            source_summary = self._current_source_summary() or {}
             return {
+                "trace_file_id": self._current_trace_file_id(),
+                "source_channel": _display_text(source_summary.get("source_channel", "")),
+                "source_bus_type": _display_text(source_summary.get("bus_type", "")).strip().upper(),
                 "adapter_id": self.binding_adapter_id_edit.text(),
                 "driver": self.binding_driver_combo.currentText(),
                 "logical_channel": self.binding_logical_channel_edit.text(),
                 "physical_channel": self.binding_physical_channel_edit.text(),
-                "bus_type": self.binding_bus_type_combo.currentText(),
-                "device_type": self.binding_device_type_edit.text(),
+                "bus_type": self.binding_bus_type_edit.text(),
+                "device_type": self.binding_device_type_combo.currentText(),
                 "device_index": self.binding_device_index_edit.text(),
                 "sdk_root": self.binding_sdk_root_edit.text(),
                 "nominal_baud": self.binding_nominal_baud_edit.text(),
@@ -1860,7 +2343,7 @@ def build_main_window(app_logic: ReplayApplication):
                     if isinstance(widget, QPlainTextEdit):
                         widget.setPlainText("")
                     elif isinstance(widget, QComboBox):
-                        widget.setCurrentIndex(0)
+                        widget.clear()
                     elif isinstance(widget, QCheckBox):
                         widget.setChecked(False)
                     else:
@@ -1869,17 +2352,25 @@ def build_main_window(app_logic: ReplayApplication):
                 return
 
             self.binding_editor_hint.hide()
-            payload = self._draft_bindings[index]
+            payload = self._coerce_binding_draft(self._draft_bindings[index])
+            self._draft_bindings[index] = payload
+            self._populate_binding_trace_file_options(_display_text(payload.get("trace_file_id", "")).strip())
+            self._populate_binding_source_options(
+                _display_text(payload.get("trace_file_id", "")).strip(),
+                _display_text(payload.get("source_channel", "")),
+                _display_text(payload.get("source_bus_type", "")).strip().upper(),
+            )
             self.binding_adapter_id_edit.setText(_display_text(payload.get("adapter_id", "")))
-            self.binding_driver_combo.setCurrentText(_display_text(payload.get("driver", "zlg")).lower() or "zlg")
+            normalized_driver = _normalize_driver_name(payload.get("driver", "zlg"))
+            self._populate_binding_driver_options(normalized_driver)
             self.binding_logical_channel_edit.setText(_display_text(payload.get("logical_channel", "")))
-            self.binding_physical_channel_edit.setText(_display_text(payload.get("physical_channel", "")))
-            self.binding_bus_type_combo.setCurrentText(_display_text(payload.get("bus_type", "CANFD")).upper() or "CANFD")
-            self.binding_device_type_edit.setText(_display_text(payload.get("device_type", "")))
+            self.binding_bus_type_edit.setText(_display_text(payload.get("bus_type", "CANFD")).upper() or "CANFD")
+            self._populate_binding_device_type_options(normalized_driver, _display_text(payload.get("device_type", "")))
             self.binding_device_index_edit.setText(_display_text(payload.get("device_index", "")))
             self.binding_sdk_root_edit.setText(_display_text(payload.get("sdk_root", "")))
             self.binding_nominal_baud_edit.setText(_display_text(payload.get("nominal_baud", "")))
             self.binding_data_baud_edit.setText(_display_text(payload.get("data_baud", "")))
+            self.binding_physical_channel_edit.setText(_display_text(payload.get("physical_channel", "")))
             self.binding_resistance_checkbox.setChecked(bool(payload.get("resistance_enabled", False)))
             self.binding_listen_only_checkbox.setChecked(bool(payload.get("listen_only", False)))
             self.binding_tx_echo_checkbox.setChecked(bool(payload.get("tx_echo", False)))
@@ -1893,10 +2384,20 @@ def build_main_window(app_logic: ReplayApplication):
         def _set_binding_editor_enabled(self, enabled: bool) -> None:
             for widget in self._binding_field_widgets.values():
                 widget.setEnabled(enabled)
+            self.binding_logical_channel_edit.setEnabled(False)
+            self.binding_bus_type_edit.setEnabled(False)
 
         def _add_binding(self) -> None:
-            self._draft_bindings.append(_new_binding_draft())
+            trace_id = self._next_unmapped_trace_id()
+            if not trace_id:
+                QMessageBox.information(self, "新增文件映射", "当前没有可新增的场景文件映射，请先勾选文件或清理已有映射。")
+                return
+            draft = _new_binding_draft(self._next_binding_logical_channel())
+            draft["trace_file_id"] = trace_id
+            draft = self._coerce_binding_draft(draft)
+            self._draft_bindings.append(draft)
             self._refresh_binding_list(select_index=len(self._draft_bindings) - 1)
+            self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation(immediate=True)
 
         def _remove_selected_binding(self) -> None:
@@ -1906,15 +2407,22 @@ def build_main_window(app_logic: ReplayApplication):
             del self._draft_bindings[index]
             next_index = min(index, len(self._draft_bindings) - 1)
             self._refresh_binding_list(select_index=next_index if next_index >= 0 else None)
+            self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation(immediate=True)
 
-        def _refresh_binding_list(self, *, select_index: Optional[int] = None) -> None:
+        def _refresh_binding_list(
+            self,
+            *,
+            select_index: Optional[int] = None,
+            reload_editor: bool = True,
+        ) -> None:
             previous_index = self.binding_list.currentRow()
             target_index = previous_index if select_index is None else select_index
             self._suspend_updates = True
             self.binding_list.clear()
+            trace_lookup = self._binding_trace_lookup()
             for index, payload in enumerate(self._draft_bindings):
-                summary = _binding_summary(payload)
+                summary = _binding_summary(payload, trace_lookup)
                 error_count = self._binding_error_counts.get(index, 0)
                 if error_count:
                     summary = f"{summary} • {error_count} 个错误"
@@ -1928,7 +2436,48 @@ def build_main_window(app_logic: ReplayApplication):
                 self.binding_list.setCurrentRow(target_index)
             self._suspend_updates = False
             self.remove_binding_button.setEnabled(self.binding_list.currentRow() >= 0)
-            self._load_selected_binding_into_editor(self.binding_list.currentRow())
+            self.add_binding_button.setEnabled(bool(self._next_unmapped_trace_id()))
+            if reload_editor:
+                self._load_selected_binding_into_editor(self.binding_list.currentRow())
+
+        def _collection_label_map(self) -> dict[int, str]:
+            return _binding_label_map(self._draft_bindings, self._binding_trace_lookup())
+
+        def _logical_channel_options(self, *, allow_empty: bool = False) -> tuple[Any, ...]:
+            options: list[Any] = []
+            if allow_empty:
+                options.append(("留空（作用于整个适配器）", ""))
+            label_map = self._collection_label_map()
+            seen_channels: set[int] = set()
+            sorted_bindings = sorted(
+                self._draft_bindings,
+                key=lambda item: (
+                    _parse_optional_int_text(item.get("logical_channel"))
+                    if _parse_optional_int_text(item.get("logical_channel")) is not None
+                    else -1,
+                    _display_text(item.get("adapter_id", "")),
+                ),
+            )
+            for binding in sorted_bindings:
+                logical_channel = _parse_optional_int_text(binding.get("logical_channel"))
+                if logical_channel is None or logical_channel in seen_channels:
+                    continue
+                seen_channels.add(logical_channel)
+                options.append((_logical_channel_label(logical_channel, label_map), logical_channel))
+            return tuple(options)
+
+        def _collection_fields(self, key: str) -> list[EditorFieldSpec]:
+            fields = list(self._collection_sections[key]["fields"])
+            if key not in {"database_bindings", "signal_overrides", "diagnostic_targets", "link_actions"}:
+                return fields
+            options = self._logical_channel_options(allow_empty=key == "link_actions")
+            resolved_fields: list[EditorFieldSpec] = []
+            for field in fields:
+                if field.key == "logical_channel":
+                    resolved_fields.append(EditorFieldSpec(field.key, field.label, "combo", options))
+                else:
+                    resolved_fields.append(field)
+            return resolved_fields
 
         def _update_collection_buttons(self, key: str) -> None:
             section = self._collection_sections[key]
@@ -1940,8 +2489,13 @@ def build_main_window(app_logic: ReplayApplication):
             section = self._collection_sections[key]
             list_widget = section["list"]
             list_widget.clear()
+            label_map = self._collection_label_map()
             for item in self._collection_data[key]:
-                list_widget.addItem(QListWidgetItem(section["summary"](item)))
+                if key == "diagnostic_actions":
+                    summary = section["summary"](item)
+                else:
+                    summary = section["summary"](item, label_map)
+                list_widget.addItem(QListWidgetItem(summary))
             self._sync_list_height(list_widget, min_rows=1)
             self._update_collection_buttons(key)
 
@@ -1962,9 +2516,13 @@ def build_main_window(app_logic: ReplayApplication):
                 if index is not None
                 else _clone_jsonable(section["default_item"]())
             )
+            if index is None and key in {"database_bindings", "signal_overrides", "diagnostic_targets"}:
+                options = self._logical_channel_options()
+                if options:
+                    initial_value["logical_channel"] = options[0][1]
             dialog = CollectionItemDialog(
                 section["title"],
-                section["fields"],
+                self._collection_fields(key),
                 section["normalize"],
                 initial_value=initial_value,
                 parent=self,
@@ -2006,14 +2564,14 @@ def build_main_window(app_logic: ReplayApplication):
 
         def _validate_current_draft(self) -> DraftValidationResult:
             issues: list[ValidationIssue] = []
-            warnings: list[str] = []
-            bindings: list[dict] = []
+            warnings: list[ValidationIssue] = []
+            normalized_bindings: list[tuple[int, dict]] = []
             for index, item in enumerate(self._draft_bindings):
                 normalized_item, item_issues = _validate_binding_draft(item, index)
                 if item_issues:
                     issues.extend(item_issues)
                     continue
-                bindings.append(normalized_item or {})
+                normalized_bindings.append((index, normalized_item or {}))
 
             normalized_collections: dict[str, list[dict]] = {
                 "database_bindings": [],
@@ -2046,11 +2604,86 @@ def build_main_window(app_logic: ReplayApplication):
             existing_trace_ids = {record.trace_id for record in self.app_logic.list_traces()}
             missing_trace_ids = [trace_id for trace_id in trace_ids if trace_id not in existing_trace_ids]
             if missing_trace_ids:
-                warnings.append(f"当前场景仍引用 {len(missing_trace_ids)} 个缺失文件。")
+                warnings.append(
+                    ValidationIssue(
+                        "traces",
+                        "trace_file_ids",
+                        f"当前场景仍引用 {len(missing_trace_ids)} 个缺失文件。",
+                    )
+                )
+
+            file_mapped_trace_ids: set[str] = set()
+            used_physical_channels: dict[tuple[str, int], int] = {}
+            has_file_mapping = False
+            for binding_index, binding in normalized_bindings:
+                if not _binding_uses_trace_source(binding):
+                    continue
+                has_file_mapping = True
+                trace_file_id = _display_text(binding.get("trace_file_id", "")).strip()
+                if trace_file_id in file_mapped_trace_ids:
+                    issues.append(
+                        ValidationIssue(
+                            "bindings",
+                            f"bindings[{binding_index}].trace_file_id",
+                            "同一个场景文件只能保留一条文件映射。",
+                        )
+                    )
+                else:
+                    file_mapped_trace_ids.add(trace_file_id)
+                if trace_file_id and trace_file_id not in trace_ids:
+                    issues.append(
+                        ValidationIssue(
+                            "bindings",
+                            f"bindings[{binding_index}].trace_file_id",
+                            "文件映射必须引用当前已勾选的场景文件。",
+                        )
+                    )
+                if trace_file_id in existing_trace_ids:
+                    summaries = self._binding_trace_source_summaries(trace_file_id)
+                    source_channel = binding.get("source_channel")
+                    source_bus_type = _display_text(binding.get("source_bus_type", "")).strip().upper()
+                    matched_summary = any(
+                        summary.get("source_channel") == source_channel
+                        and _display_text(summary.get("bus_type", "")).strip().upper() == source_bus_type
+                        for summary in summaries
+                    )
+                    if summaries and not matched_summary:
+                        issues.append(
+                            ValidationIssue(
+                                "bindings",
+                                f"bindings[{binding_index}].source_selector",
+                                "所选源项不属于当前文件，请重新选择。",
+                            )
+                        )
+                channel_key = (str(binding.get("adapter_id", "")), int(binding.get("physical_channel", 0)))
+                existing_binding_index = used_physical_channels.get(channel_key)
+                if existing_binding_index is not None:
+                    issues.append(
+                        ValidationIssue(
+                            "bindings",
+                            f"bindings[{binding_index}].physical_channel",
+                            "同一个物理通道同一时刻只能映射一个文件。",
+                        )
+                    )
+                else:
+                    used_physical_channels[channel_key] = binding_index
+
+            for binding_index, binding in normalized_bindings:
+                warning = _binding_device_type_warning(binding, binding_index)
+                if warning is not None:
+                    warnings.append(warning)
+
+            if has_file_mapping:
+                missing_mapped_trace_ids = sorted(set(trace_ids) - file_mapped_trace_ids)
+                if missing_mapped_trace_ids:
+                    issues.append(
+                        ValidationIssue("traces", "trace_file_ids", "已勾选的场景文件必须全部完成文件映射。")
+                    )
 
             if issues:
                 return DraftValidationResult(None, issues, warnings)
 
+            bindings = [binding for _, binding in normalized_bindings]
             payload = {
                 "scenario_id": self.scenario_id_edit.text().strip() or uuid.uuid4().hex,
                 "name": self.scenario_name_edit.text().strip() or "新场景",
@@ -2102,11 +2735,17 @@ def build_main_window(app_logic: ReplayApplication):
         def _validate_scenario(self) -> None:
             result = self._run_live_validation(
                 focus_first_error=True,
-                success_message="校验通过，可保存。",
                 failure_message="校验失败，已定位到第一个错误。",
             )
             if result.errors:
                 return
+            if result.warnings:
+                self._feedback_message = f"校验通过，但仍有 {len(result.warnings)} 个提示需要关注。"
+                self._feedback_tone = "warn"
+            else:
+                self._feedback_message = "校验通过，可保存。"
+                self._feedback_tone = "good"
+            self._apply_validation_visuals()
 
         def _save_scenario(self) -> None:
             result = self._run_live_validation(
@@ -2135,8 +2774,12 @@ def build_main_window(app_logic: ReplayApplication):
             self._raw_dirty = False
             self._on_saved(_clone_jsonable(saved_payload))
             self.load_payload(saved_payload)
-            self._feedback_message = "场景已保存。"
-            self._feedback_tone = "good"
+            if self._validation_warnings:
+                self._feedback_message = f"场景已保存；仍有 {len(self._validation_warnings)} 个提示需要关注。"
+                self._feedback_tone = "warn"
+            else:
+                self._feedback_message = "场景已保存。"
+                self._feedback_tone = "good"
             self._apply_validation_visuals()
             return True
 
@@ -2184,17 +2827,31 @@ def build_main_window(app_logic: ReplayApplication):
                         self._set_binding_field_error(suffix, issue.message)
 
             warning_counts = {key: 0 for key in self._section_boxes}
-            if self._validation_warnings:
-                warning_counts["traces"] = len(self._validation_warnings)
-                self.trace_warning_label.setText("\n".join(self._validation_warnings))
+            trace_warning_messages = [warning.message for warning in self._validation_warnings if warning.section == "traces"]
+            binding_warning_messages = [warning.message for warning in self._validation_warnings if warning.section == "bindings"]
+            for warning in self._validation_warnings:
+                warning_counts[warning.section] = warning_counts.get(warning.section, 0) + 1
+            if trace_warning_messages:
+                self.trace_warning_label.setText("\n".join(trace_warning_messages))
                 self.trace_warning_label.setProperty("tone", "warn")
                 self.trace_warning_label.show()
                 self._refresh_style(self.trace_warning_label)
             else:
                 self.trace_warning_label.clear()
                 self.trace_warning_label.hide()
+            if binding_warning_messages:
+                self.binding_warning_label.setText("\n".join(binding_warning_messages))
+                self.binding_warning_label.setProperty("tone", "warn")
+                self.binding_warning_label.show()
+                self._refresh_style(self.binding_warning_label)
+            else:
+                self.binding_warning_label.clear()
+                self.binding_warning_label.hide()
 
-            self._refresh_binding_list(select_index=self.binding_list.currentRow())
+            self._refresh_binding_list(
+                select_index=self.binding_list.currentRow(),
+                reload_editor=False,
+            )
             self._update_section_titles(section_error_counts, warning_counts)
             self._update_status_labels()
 
@@ -2264,7 +2921,7 @@ def build_main_window(app_logic: ReplayApplication):
                 detail = self._validation_errors[0].message
                 detail_tone = "error"
             elif warning_count:
-                detail = self._validation_warnings[0]
+                detail = self._validation_warnings[0].message
                 detail_tone = "warn"
             elif self._is_dirty or self._raw_dirty:
                 detail = "当前草稿已变更，最近一次有效草稿已同步到主窗口摘要。"
@@ -2278,6 +2935,10 @@ def build_main_window(app_logic: ReplayApplication):
 
         def _focus_issue(self, issue: ValidationIssue) -> None:
             self.editor_tabs.setCurrentIndex(0)
+            if issue.path == "trace_file_ids":
+                self.scenario_trace_list.setFocus()
+                self.form_scroll.ensureWidgetVisible(self.scenario_trace_list, 24, 24)
+                return
             if issue.path in self._field_widgets:
                 widget = self._field_widgets[issue.path]
                 widget.setFocus()
@@ -3195,6 +3856,7 @@ def build_main_window(app_logic: ReplayApplication):
             summary = _build_runtime_visibility_summary(
                 snapshot,
                 self._current_scenario_payload.get("bindings", []),
+                self._trace_lookup,
             )
             self.runtime_progress_label.setText(summary.progress_text)
             self.runtime_source_label.setText(summary.source_text)

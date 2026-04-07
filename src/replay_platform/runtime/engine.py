@@ -232,11 +232,17 @@ class ReplayEngine:
             return {}
         available_channels = {descriptor.physical_channel for descriptor in descriptors}
         start_plan: Dict[int, ChannelConfig] = {}
+        file_mapped_physical_channels: Dict[int, DeviceChannelBinding] = {}
         for binding in bindings:
             if available_channels and binding.physical_channel not in available_channels:
                 raise ConfigurationError(
                     f"适配器通道 {binding.physical_channel} 不存在，无法绑定逻辑通道 {binding.logical_channel}。"
                 )
+            if binding.uses_trace_source():
+                existing_file_mapping = file_mapped_physical_channels.get(binding.physical_channel)
+                if existing_file_mapping is not None:
+                    raise ConfigurationError(f"物理通道 {binding.physical_channel} 已被其他文件映射占用。")
+                file_mapped_physical_channels[binding.physical_channel] = binding
             config = binding.channel_config()
             existing = start_plan.get(binding.physical_channel)
             if existing is None:

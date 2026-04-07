@@ -4,7 +4,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from replay_platform.core import BusType, FrameEvent, canfd_payload_length_to_dlc
 from replay_platform.errors import DependencyUnavailableError, TraceFormatError
@@ -32,6 +32,22 @@ class TraceSummary:
     event_count: int
     start_ns: int
     end_ns: int
+
+
+def build_trace_source_summaries(events: Sequence[FrameEvent]) -> list[dict[str, Any]]:
+    counts: Dict[tuple[int, BusType], int] = {}
+    for event in events:
+        key = (int(event.channel), event.bus_type)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {
+            "source_channel": source_channel,
+            "bus_type": bus_type.value,
+            "frame_count": frame_count,
+            "label": f"CH{source_channel} | {bus_type.value} | {frame_count}\u5e27",
+        }
+        for (source_channel, bus_type), frame_count in sorted(counts.items(), key=lambda item: (item[0][0], item[0][1].value))
+    ]
 
 
 class TraceLoader:

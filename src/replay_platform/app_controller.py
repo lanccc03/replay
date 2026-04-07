@@ -3,15 +3,18 @@ from __future__ import annotations
 import threading
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from replay_platform.adapters.base import DiagnosticClient, DeviceAdapter
 from replay_platform.adapters.mock import MockDeviceAdapter
 from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.adapters.zlg import ZlgDeviceAdapter
 from replay_platform.core import (
+    AdapterCapabilities,
+    ChannelDescriptor,
     DeviceChannelBinding,
     DiagnosticTransport,
+    FrameEvent,
     ReplayFrameLogMode,
     ReplayLaunchSource,
     ReplayLogConfig,
@@ -164,6 +167,9 @@ class ReplayApplication:
     def get_trace_file(self, trace_id: str):
         return self.library.get_trace_file(trace_id)
 
+    def get_trace_source_summaries(self, trace_id: str) -> list[dict]:
+        return self.library.get_trace_source_summaries(trace_id)
+
     def find_scenarios_referencing_trace(self, trace_id: str):
         return self.library.find_scenarios_referencing_trace(trace_id)
 
@@ -194,14 +200,7 @@ class ReplayApplication:
         loop_enabled: bool = False,
     ) -> None:
         self.frame_enables.clear_all()
-        frames = []
-        for trace_id in scenario.trace_file_ids:
-            record = self.library.get_trace_file(trace_id)
-            trace_events = self.library.load_trace_events(trace_id)
-            if record is not None:
-                trace_events = [event.clone(source_file=record.original_path or record.name) for event in trace_events]
-            frames.extend(trace_events)
-        frames.sort(key=lambda item: item.ts_ns)
+        frames = self._load_replay_frames(scenario)
         for binding in scenario.database_bindings:
             self.signal_overrides.load_database(binding.logical_channel, binding.path)
         for override in scenario.signal_overrides:
@@ -229,6 +228,74 @@ class ReplayApplication:
 
     def resume_replay(self) -> None:
         self.engine.resume()
+
+    def probe_binding_channels(self, binding: DeviceChannelBinding) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "channels": [],
+            "capabilities": AdapterCapabilities(),
+            "error": "",
+        }
+        scenario = ScenarioSpec(scenario_id="probe-binding", name="probe-binding", bindings=[binding])
+        adapter: DeviceAdapter | None = None
+        try:
+            adapters = self._build_adapters(scenario)
+            adapter = adapters.get(binding.adapter_id)
+            if adapter is None:
+                result["error"] = f"未找到适配器 {binding.adapter_id}。"
+                return result
+            result["capabilities"] = adapter.capabilities()
+            result["channels"] = list(adapter.enumerate_channels())
+            return result
+        except Exception as exc:
+            result["error"] = str(exc)
+            return result
+        finally:
+            if adapter is not None:
+                try:
+                    adapter.close()
+                except Exception:
+                    pass
+
+    def _load_replay_frames(self, scenario: ScenarioSpec) -> List[FrameEvent]:
+        frames: List[FrameEvent] = []
+        trace_bound_bindings: Dict[str, List[DeviceChannelBinding]] = {}
+        for binding in scenario.bindings:
+            if not binding.trace_file_id:
+                continue
+            if binding.source_channel is None or binding.source_bus_type is None:
+                raise ValueError(f"逻辑通道 {binding.logical_channel} 的文件映射不完整。")
+            trace_bound_bindings.setdefault(binding.trace_file_id, []).append(binding)
+        missing_trace_ids = sorted(set(trace_bound_bindings) - set(scenario.trace_file_ids))
+        if missing_trace_ids:
+            raise ValueError(f"存在未勾选但仍被映射的文件：{', '.join(missing_trace_ids)}")
+
+        for trace_id in scenario.trace_file_ids:
+            record = self.library.get_trace_file(trace_id)
+            trace_events = self.library.load_trace_events(trace_id)
+            if record is not None:
+                trace_events = [event.clone(source_file=record.original_path or record.name) for event in trace_events]
+            mapped_bindings = trace_bound_bindings.get(trace_id, [])
+            if mapped_bindings:
+                for binding in mapped_bindings:
+                    frames.extend(self._map_trace_events_for_binding(trace_events, binding))
+                continue
+            frames.extend(trace_events)
+        frames.sort(key=lambda item: item.ts_ns)
+        return frames
+
+    @staticmethod
+    def _map_trace_events_for_binding(
+        trace_events: List[FrameEvent],
+        binding: DeviceChannelBinding,
+    ) -> List[FrameEvent]:
+        assert binding.source_channel is not None
+        assert binding.source_bus_type is not None
+        mapped_events: List[FrameEvent] = []
+        for event in trace_events:
+            if event.channel != binding.source_channel or event.bus_type != binding.source_bus_type:
+                continue
+            mapped_events.append(event.clone(channel=binding.logical_channel))
+        return mapped_events
 
     def _build_adapters(self, scenario: ScenarioSpec) -> Dict[str, DeviceAdapter]:
         adapters: Dict[str, DeviceAdapter] = {}
