@@ -10,6 +10,7 @@ from replay_platform.adapters.mock import MockDeviceAdapter
 from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.adapters.zlg import ZlgDeviceAdapter
 from replay_platform.core import (
+    DeviceChannelBinding,
     DiagnosticTransport,
     ReplayFrameLogMode,
     ReplayLaunchSource,
@@ -231,16 +232,19 @@ class ReplayApplication:
 
     def _build_adapters(self, scenario: ScenarioSpec) -> Dict[str, DeviceAdapter]:
         adapters: Dict[str, DeviceAdapter] = {}
+        bindings_by_adapter: Dict[str, List[DeviceChannelBinding]] = {}
         for binding in scenario.bindings:
-            if binding.adapter_id in adapters:
-                continue
+            bindings_by_adapter.setdefault(binding.adapter_id, []).append(binding)
+        for adapter_id, binding_group in bindings_by_adapter.items():
+            binding = binding_group[0]
             driver = binding.driver.lower()
             if driver == "zlg":
-                adapters[binding.adapter_id] = ZlgDeviceAdapter(binding.adapter_id, binding)
+                adapters[adapter_id] = ZlgDeviceAdapter(adapter_id, binding)
             elif driver == "tongxing":
-                adapters[binding.adapter_id] = TongxingDeviceAdapter(binding.adapter_id)
+                seed_binding = max(binding_group, key=lambda item: int(item.physical_channel))
+                adapters[adapter_id] = TongxingDeviceAdapter(adapter_id, seed_binding)
             elif driver == "mock":
-                adapters[binding.adapter_id] = MockDeviceAdapter(binding.adapter_id)
+                adapters[adapter_id] = MockDeviceAdapter(adapter_id)
             else:
                 raise ValueError(f"不支持的驱动类型：{binding.driver}")
         return adapters

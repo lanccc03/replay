@@ -181,7 +181,7 @@ class FileLibraryService:
     def find_scenarios_referencing_trace(self, trace_id: str) -> List[ScenarioSpec]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT body_json FROM scenarios ORDER BY updated_at DESC"
+                "SELECT body_json FROM scenarios ORDER BY updated_at DESC, rowid DESC"
             ).fetchall()
         scenarios: list[ScenarioSpec] = []
         for row in rows:
@@ -304,7 +304,7 @@ class FileLibraryService:
     def list_scenarios(self) -> List[ScenarioSpec]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT body_json FROM scenarios ORDER BY updated_at DESC"
+                "SELECT body_json FROM scenarios ORDER BY updated_at DESC, rowid DESC"
             ).fetchall()
         return [ScenarioSpec.from_dict(json.loads(row[0])) for row in rows]
 

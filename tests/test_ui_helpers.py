@@ -8,6 +8,7 @@ from replay_platform.ui.main_window import (
     _assess_scenario_launch,
     _build_log_level_hint,
     _format_replay_stats,
+    _binding_draft_from_item,
     _binding_summary,
     _frame_enable_rule_summary,
     _build_scenario_delete_summary,
@@ -29,6 +30,7 @@ from replay_platform.ui.main_window import (
     _plan_log_refresh,
     _log_level_option,
     _parse_log_level_option,
+    _normalize_binding_item,
     _scenario_payload_is_dirty,
     _should_reset_current_scenario_after_delete,
     _validate_binding_draft,
@@ -146,6 +148,70 @@ class MainWindowHelperTests(unittest.TestCase):
             ["bindings[0].adapter_id", "bindings[0].resistance_enabled", "bindings[0].network"],
             [issue.path for issue in issues],
         )
+
+    def test_binding_draft_from_item_uses_tongxing_sdk_default(self) -> None:
+        draft = _binding_draft_from_item(
+            {
+                "adapter_id": "tongxing0",
+                "driver": "tongxing",
+                "logical_channel": 0,
+                "physical_channel": 1,
+                "bus_type": "CANFD",
+                "device_type": "TC1014",
+            }
+        )
+
+        self.assertEqual("TSMasterApi", draft["sdk_root"])
+
+    def test_normalize_binding_item_uses_tongxing_sdk_default(self) -> None:
+        normalized = _normalize_binding_item(
+            {
+                "adapter_id": "tongxing0",
+                "driver": "tongxing",
+                "logical_channel": "0",
+                "physical_channel": "1",
+                "bus_type": "CANFD",
+                "device_type": "TC1014",
+                "device_index": "0",
+                "sdk_root": "",
+                "nominal_baud": "500000",
+                "data_baud": "2000000",
+                "resistance_enabled": True,
+                "listen_only": False,
+                "tx_echo": False,
+                "merge_receive": False,
+                "network": "{}",
+                "metadata": "{}",
+            }
+        )
+
+        self.assertEqual("TSMasterApi", normalized["sdk_root"])
+
+    def test_validate_binding_draft_uses_tongxing_sdk_default(self) -> None:
+        normalized, issues = _validate_binding_draft(
+            {
+                "adapter_id": "tongxing0",
+                "driver": "tongxing",
+                "logical_channel": "0",
+                "physical_channel": "1",
+                "bus_type": "CANFD",
+                "device_type": "TC1014",
+                "device_index": "0",
+                "sdk_root": "",
+                "nominal_baud": "500000",
+                "data_baud": "2000000",
+                "resistance_enabled": True,
+                "listen_only": False,
+                "tx_echo": False,
+                "merge_receive": False,
+                "network": "{}",
+                "metadata": "{}",
+            },
+            0,
+        )
+
+        self.assertEqual([], issues)
+        self.assertEqual("TSMasterApi", normalized["sdk_root"])
 
     def test_build_json_preview_uses_last_valid_payload_when_errors_exist(self) -> None:
         last_valid_payload = {

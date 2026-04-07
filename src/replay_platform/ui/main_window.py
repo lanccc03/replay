@@ -646,7 +646,7 @@ def _new_binding_draft() -> dict:
         "bus_type": "CANFD",
         "device_type": "USBCANFD",
         "device_index": "0",
-        "sdk_root": "zlgcan_python_251211",
+        "sdk_root": _default_sdk_root_for_driver("zlg"),
         "nominal_baud": "500000",
         "data_baud": "2000000",
         "resistance_enabled": True,
@@ -658,16 +658,21 @@ def _new_binding_draft() -> dict:
     }
 
 
+def _default_sdk_root_for_driver(driver: Any) -> str:
+    return "TSMasterApi" if _display_text(driver).strip().lower() == "tongxing" else "zlgcan_python_251211"
+
+
 def _binding_draft_from_item(item: dict) -> dict:
+    driver = _display_text(item.get("driver", "zlg")).lower() or "zlg"
     return {
         "adapter_id": item.get("adapter_id", ""),
-        "driver": _display_text(item.get("driver", "zlg")).lower() or "zlg",
+        "driver": driver,
         "logical_channel": _display_text(item.get("logical_channel", 0)),
         "physical_channel": _display_text(item.get("physical_channel", 0)),
         "bus_type": _display_text(item.get("bus_type", "CANFD")).upper() or "CANFD",
         "device_type": item.get("device_type", ""),
         "device_index": _display_text(item.get("device_index", 0)),
-        "sdk_root": item.get("sdk_root", "zlgcan_python_251211"),
+        "sdk_root": item.get("sdk_root", _default_sdk_root_for_driver(driver)),
         "nominal_baud": _display_text(item.get("nominal_baud", 500000)),
         "data_baud": _display_text(item.get("data_baud", 2000000)),
         "resistance_enabled": bool(item.get("resistance_enabled", True)),
@@ -681,15 +686,16 @@ def _binding_draft_from_item(item: dict) -> dict:
 
 def _normalize_binding_item(item: dict, *, path_prefix: str = "bindings[0]") -> dict:
     try:
+        driver = _parse_choice_text(
+            item.get("driver", "zlg"),
+            "驱动",
+            DRIVER_OPTIONS,
+            default="zlg",
+            normalize=str.lower,
+        )
         return {
             "adapter_id": _require_text(item.get("adapter_id", ""), "适配器ID"),
-            "driver": _parse_choice_text(
-                item.get("driver", "zlg"),
-                "驱动",
-                DRIVER_OPTIONS,
-                default="zlg",
-                normalize=str.lower,
-            ),
+            "driver": driver,
             "logical_channel": _parse_int_text(item.get("logical_channel", ""), "逻辑通道"),
             "physical_channel": _parse_int_text(item.get("physical_channel", ""), "物理通道"),
             "bus_type": _parse_choice_text(
@@ -701,7 +707,7 @@ def _normalize_binding_item(item: dict, *, path_prefix: str = "bindings[0]") -> 
             ),
             "device_type": _require_text(item.get("device_type", ""), "设备类型"),
             "device_index": _parse_int_text(item.get("device_index", ""), "设备索引", allow_empty=True, default=0),
-            "sdk_root": _display_text(item.get("sdk_root", "")).strip() or "zlgcan_python_251211",
+            "sdk_root": _display_text(item.get("sdk_root", "")).strip() or _default_sdk_root_for_driver(driver),
             "nominal_baud": _parse_int_text(item.get("nominal_baud", ""), "仲裁波特率", allow_empty=True, default=500000),
             "data_baud": _parse_int_text(item.get("data_baud", ""), "数据波特率", allow_empty=True, default=2000000),
             "resistance_enabled": _parse_bool_text(item.get("resistance_enabled", False), "终端电阻"),
@@ -731,6 +737,7 @@ def _validate_binding_draft(item: dict, index: int) -> tuple[Optional[dict], lis
         "driver",
         lambda: _parse_choice_text(item.get("driver", "zlg"), "驱动", DRIVER_OPTIONS, default="zlg", normalize=str.lower),
     )
+    driver = normalized.get("driver", "zlg")
     capture("logical_channel", lambda: _parse_int_text(item.get("logical_channel", ""), "逻辑通道"))
     capture("physical_channel", lambda: _parse_int_text(item.get("physical_channel", ""), "物理通道"))
     capture(
@@ -739,7 +746,7 @@ def _validate_binding_draft(item: dict, index: int) -> tuple[Optional[dict], lis
     )
     capture("device_type", lambda: _require_text(item.get("device_type", ""), "设备类型"))
     capture("device_index", lambda: _parse_int_text(item.get("device_index", ""), "设备索引", allow_empty=True, default=0))
-    normalized["sdk_root"] = _display_text(item.get("sdk_root", "")).strip() or "zlgcan_python_251211"
+    normalized["sdk_root"] = _display_text(item.get("sdk_root", "")).strip() or _default_sdk_root_for_driver(driver)
     capture(
         "nominal_baud",
         lambda: _parse_int_text(item.get("nominal_baud", ""), "仲裁波特率", allow_empty=True, default=500000),

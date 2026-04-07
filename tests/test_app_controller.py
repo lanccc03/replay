@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import tests.bootstrap  # noqa: F401
 
@@ -207,6 +208,40 @@ class ReplayApplicationLogTests(unittest.TestCase):
             app.stop_replay()
 
             self.assertEqual([], app.frame_enables.list_rules())
+
+    def test_build_adapters_passes_full_binding_to_tongxing_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            primary = DeviceChannelBinding(
+                adapter_id="tongxing0",
+                driver="tongxing",
+                logical_channel=0,
+                physical_channel=0,
+                bus_type=BusType.CAN,
+                device_type="TC1014",
+                sdk_root="TSMasterApi",
+            )
+            seed = DeviceChannelBinding(
+                adapter_id="tongxing0",
+                driver="tongxing",
+                logical_channel=1,
+                physical_channel=2,
+                bus_type=BusType.CANFD,
+                device_type="TC1014",
+                sdk_root="TSMasterApi",
+                metadata={"ts_application": "BenchApp"},
+            )
+            scenario = ScenarioSpec(
+                scenario_id="scenario-1",
+                name="tongxing",
+                bindings=[primary, seed],
+            )
+
+            with patch("replay_platform.app_controller.TongxingDeviceAdapter") as adapter_cls:
+                adapters = app._build_adapters(scenario)
+
+            adapter_cls.assert_called_once_with("tongxing0", seed)
+            self.assertIs(adapter_cls.return_value, adapters["tongxing0"])
 
 
 if __name__ == "__main__":
