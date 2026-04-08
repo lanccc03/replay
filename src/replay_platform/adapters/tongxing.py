@@ -32,6 +32,7 @@ from replay_platform.errors import ConfigurationError
 _DEFAULT_SDK_ROOT = "TSMasterApi"
 _DEFAULT_FALLBACK_CHANNEL_COUNT = 8
 _MAX_FIFO_READ = 256
+_SYNC_TRANSMIT_TIMEOUT_MS = 50
 
 
 class _TSMasterRuntime:
@@ -575,11 +576,11 @@ class TongxingDeviceAdapter(DeviceAdapter):
     def _transmit_event_locked(self, event: FrameEvent) -> Any:
         if event.bus_type == BusType.CANFD:
             frame = self._build_canfd_frame(event)
-            return self._runtime.ts_api.tsapp_transmit_canfd_async(byref(frame))
+            return self._runtime.ts_api.tsapp_transmit_canfd_sync(byref(frame), _SYNC_TRANSMIT_TIMEOUT_MS)
         if event.bus_type == BusType.ETH:
             raise AdapterOperationError("Tongxing adapter does not support raw ETH replay.")
         frame = self._build_can_frame(event)
-        return self._runtime.ts_api.tsapp_transmit_can_async(byref(frame))
+        return self._runtime.ts_api.tsapp_transmit_can_sync(byref(frame), _SYNC_TRANSMIT_TIMEOUT_MS)
 
     def _build_can_frame(self, event: FrameEvent):
         frame = self._runtime.ts_struct.TLIBCAN()

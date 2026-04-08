@@ -98,9 +98,18 @@ class _FakeEnumModule:
 
 
 class _FakeTsApi:
-    def __init__(self, *, channel_count: int = 4, mapping_error_code: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        channel_count: int = 4,
+        mapping_error_code: int | None = None,
+        can_sync_error_code: int | None = None,
+        canfd_sync_error_code: int | None = None,
+    ) -> None:
         self.channel_count = channel_count
         self.mapping_error_code = mapping_error_code
+        self.can_sync_error_code = can_sync_error_code
+        self.canfd_sync_error_code = canfd_sync_error_code
         self.use_project_mapping = False
         self.devices = [
             {
@@ -117,6 +126,8 @@ class _FakeTsApi:
         self.canfd_configs: list[dict] = []
         self.sent_can: list[dict] = []
         self.sent_canfd: list[dict] = []
+        self.sent_can_async: list[dict] = []
+        self.sent_canfd_async: list[dict] = []
         self.can_rx: dict[int, list[_FakeTLIBCAN]] = {}
         self.canfd_rx: dict[int, list[_FakeTLIBCANFD]] = {}
         self.fifo_enabled = False
@@ -221,7 +232,7 @@ class _FakeTsApi:
 
     def tsapp_transmit_can_async(self, frame_ptr) -> int:
         frame = frame_ptr._obj
-        self.sent_can.append(
+        self.sent_can_async.append(
             {
                 "channel": int(frame.FIdxChn),
                 "properties": int(frame.FProperties),
@@ -236,7 +247,7 @@ class _FakeTsApi:
     def tsapp_transmit_canfd_async(self, frame_ptr) -> int:
         frame = frame_ptr._obj
         payload_length = _DLC_DATA_BYTE_CNT[int(frame.FDLC)]
-        self.sent_canfd.append(
+        self.sent_canfd_async.append(
             {
                 "channel": int(frame.FIdxChn),
                 "properties": int(frame.FProperties),
@@ -247,6 +258,42 @@ class _FakeTsApi:
                 "payload": bytes(frame.FData[:payload_length]),
             }
         )
+        return 0
+
+    def tsapp_transmit_can_sync(self, frame_ptr, timeout_ms: int) -> int:
+        frame = frame_ptr._obj
+        self.sent_can.append(
+            {
+                "channel": int(frame.FIdxChn),
+                "properties": int(frame.FProperties),
+                "dlc": int(frame.FDLC),
+                "identifier": int(frame.FIdentifier),
+                "timestamp_us": int(frame.FTimeUs),
+                "payload": bytes(frame.FData[: int(frame.FDLC)]),
+                "timeout_ms": int(timeout_ms),
+            }
+        )
+        if self.can_sync_error_code is not None:
+            return int(self.can_sync_error_code)
+        return 0
+
+    def tsapp_transmit_canfd_sync(self, frame_ptr, timeout_ms: int) -> int:
+        frame = frame_ptr._obj
+        payload_length = _DLC_DATA_BYTE_CNT[int(frame.FDLC)]
+        self.sent_canfd.append(
+            {
+                "channel": int(frame.FIdxChn),
+                "properties": int(frame.FProperties),
+                "dlc": int(frame.FDLC),
+                "fd_properties": int(frame.FFDProperties),
+                "identifier": int(frame.FIdentifier),
+                "timestamp_us": int(frame.FTimeUs),
+                "payload": bytes(frame.FData[:payload_length]),
+                "timeout_ms": int(timeout_ms),
+            }
+        )
+        if self.canfd_sync_error_code is not None:
+            return int(self.canfd_sync_error_code)
         return 0
 
     def tsfifo_receive_can_msgs(self, buffer, size_ptr, channel: int, _include_tx: bool) -> int:
@@ -433,9 +480,35 @@ class TongxingAdapterTests(unittest.TestCase):
         self.assertGreaterEqual(runtime.ensure_connected_calls, 2)
         self.assertEqual(0xC, runtime.ts_api.sent_canfd[0]["dlc"])
         self.assertEqual(payload, runtime.ts_api.sent_canfd[0]["payload"])
+        self.assertEqual(50, runtime.ts_api.sent_canfd[0]["timeout_ms"])
         self.assertTrue(runtime.ts_api.sent_canfd[0]["properties"] & 0x04)
         self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x01)
         self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x02)
+        self.assertEqual([], runtime.ts_api.sent_canfd_async)
+
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_send_canfd_sync_timeout_raises_error_and_does_not_fall_back_to_async(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CANFD)
+        api = _FakeTsApi(canfd_sync_error_code=408)
+        adapter, runtime = self._make_adapter(binding, api)
+        adapter.start_channel(0, binding.channel_config())
+
+        event = FrameEvent(
+            ts_ns=456_000,
+            bus_type=BusType.CANFD,
+            channel=0,
+            message_id=0x18DAF110,
+            payload=bytes(range(12)),
+            dlc=0x9,
+            flags={"extended": True},
+        )
+
+        with self.assertRaisesRegex(Exception, "transmit frame on channel 0 failed"):
+            adapter.send([event])
+
+        self.assertEqual(1, len(runtime.ts_api.sent_canfd))
+        self.assertEqual(50, runtime.ts_api.sent_canfd[0]["timeout_ms"])
+        self.assertEqual([], runtime.ts_api.sent_canfd_async)
 
     @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
     def test_read_returns_sorted_frames_across_started_channels(self, _platform_system) -> None:
