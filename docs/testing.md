@@ -57,7 +57,7 @@ $env:PYTHONPYCACHEPREFIX = (Join-Path $PWD ".pycache_tmp")
 - `tests/test_zlg_adapter.py`
   ZLG 适配器封装与 CAN FD 发送行为
 - `tests/test_tongxing_adapter.py`
-  同星占位适配器封装与结构行为
+  同星 TSMaster 适配器封装、项目回退、收发与连接状态行为
 
 ## 3. 最低验证要求
 
@@ -85,7 +85,7 @@ $env:PYTHONPYCACHEPREFIX = (Join-Path $PWD ".pycache_tmp")
 
 ## 4. 验证边界
 
-- 非 Windows 环境允许做结构开发、单元测试和语法检查，但不能声称已完成 ZLG 真机联调
+- 非 Windows 环境允许做结构开发、单元测试和语法检查，但不能声称已完成 ZLG / 同星 真机联调
 - `tests/test_zlg_adapter.py` 与 `tests/test_tongxing_adapter.py` 只覆盖封装和模拟路径，不等于真机联调
 - Qt 自动化测试不等于完整人工点击验证
-- 涉及 ZLG / DoIP / 回放时序的改动，除了自动化测试外，通常还需要明确说明未覆盖的手工或硬件验证范围
+- 涉及 ZLG / 同星 / DoIP / 回放时序的改动，除了自动化测试外，通常还需要明确说明未覆盖的手工或硬件验证范围

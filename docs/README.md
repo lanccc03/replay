@@ -18,5 +18,5 @@
 - [`architecture.md`](./architecture.md)：项目分层、统一时间轴、核心模块职责、扩展约束
 - [`scenario-and-trace.md`](./scenario-and-trace.md)：场景 JSON 结构、trace 导入缓存、信号覆盖、运行数据目录
 - [`diagnostics.md`](./diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
-- [`zlg-hardware.md`](./zlg-hardware.md)：Windows / ZLG 环境准备、已知限制、联调顺序
+- [`zlg-hardware.md`](./zlg-hardware.md)：Windows / ZLG / 同星 环境准备、已知限制、联调顺序
 - [`testing.md`](./testing.md)：验证命令、测试映射、最低验证要求与验证边界

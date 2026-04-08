@@ -1,6 +1,6 @@
 # Windows 多总线 Replay / 诊断平台
 
-面向 Windows 的多总线回放与诊断桌面工具，围绕 ZLG 设备覆盖 CAN、CANFD、J1939、DoIP 的统一回放、场景管理、信号在线改值和 DTC 诊断流程。
+面向 Windows 的多总线回放与诊断桌面工具，围绕 ZLG / 同星设备覆盖 CAN、CANFD、J1939 回放，并提供 DoIP 诊断、场景管理、信号在线改值和 DTC 诊断流程。
 
 更详细的专题说明已经拆分到 [`docs/`](docs/README.md)；如果你是工程代理，请先读 [`agents.md`](agents.md)。
 
@@ -12,7 +12,7 @@
 - 回放启停、暂停、恢复
 - Trace 文件导入、缓存、场景持久化
 - DBC / J1939 DBC 信号覆盖
-- ZLG 设备适配层
+- ZLG / 同星设备适配层
 - CAN UDS、DoIP、DTC 诊断
 - PySide6 中文桌面界面
 
@@ -20,8 +20,8 @@
 
 - ETH 在 V1 中主要指 DoIP 诊断链路，不是通用原始以太网帧回放
 - 在线信号改值依赖 DBC / J1939 DBC；未绑定数据库时只支持原始帧回放
-- 同星适配器当前仍是占位接口
-- ZLG 真实硬件能力只能在 Windows 上完成联调验证
+- 同星设备已接入 TSMaster 适配器，当前自动化测试覆盖封装与模拟收发路径
+- ZLG 与同星真实硬件能力只能在 Windows 上完成联调验证
 
 ## 2. 环境要求与启动
 
@@ -76,6 +76,8 @@ python -m unittest discover -s tests -v
 
 ZLG 真机接入前的准备与限制说明见 [`docs/zlg-hardware.md`](docs/zlg-hardware.md)。
 
+同星设备当前没有单独示例场景，可在场景编辑器中选择 `driver=tongxing` 后按实际型号配置绑定；相关环境与字段说明同样见 [`docs/zlg-hardware.md`](docs/zlg-hardware.md)。
+
 ## 4. 目录概览
 
 ```text
@@ -91,6 +93,7 @@ replay/
 │   ├── app_controller.py          应用编排入口
 │   ├── core.py                    核心类型定义
 │   └── __main__.py                启动入口
+├── TSMasterApi/                   同星 TSMaster Python 包与 DLL
 ├── tests/                         单元测试
 └── zlgcan_python_251211/          ZLG SDK 及 DLL
 ```
@@ -103,7 +106,7 @@ replay/
 - [`docs/architecture.md`](docs/architecture.md)：分层架构、核心模块职责、统一时间轴模型
 - [`docs/scenario-and-trace.md`](docs/scenario-and-trace.md)：场景 JSON、trace 导入、信号覆盖、运行数据目录
 - [`docs/diagnostics.md`](docs/diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
-- [`docs/zlg-hardware.md`](docs/zlg-hardware.md)：Windows / ZLG 环境准备、已知限制、联调顺序
+- [`docs/zlg-hardware.md`](docs/zlg-hardware.md)：Windows / ZLG / 同星 环境准备、已知限制、联调顺序
 - [`docs/testing.md`](docs/testing.md)：验证命令、测试映射、最低验证要求与验证边界
 
 如果你是在本仓库中执行改动任务的工程代理，请额外阅读：
@@ -118,6 +121,7 @@ replay/
 - `src/replay_platform/app_controller.py`
 - `src/replay_platform/runtime/engine.py`
 - `src/replay_platform/adapters/zlg.py`
+- `src/replay_platform/adapters/tongxing.py`
 - `src/replay_platform/ui/main_window.py`
 
 示例场景：

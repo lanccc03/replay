@@ -14,22 +14,23 @@
 - 按任务补读：
   - 场景 / trace / 信号覆盖：`docs/scenario-and-trace.md`
   - 诊断：`docs/diagnostics.md`
-  - Windows / ZLG 边界：`docs/zlg-hardware.md`
+  - Windows / ZLG / 同星 硬件边界：`docs/zlg-hardware.md`
   - 验证要求：`docs/testing.md`
   - Trace 导入：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
   - DBC / 信号覆盖：`src/replay_platform/services/signal_catalog.py`
   - ZLG 设备：`src/replay_platform/adapters/zlg.py`
+  - 同星设备：`src/replay_platform/adapters/tongxing.py`
   - 录制：`src/replay_platform/runtime/recorder.py`
 
 ## 2. 不要越界
 
-- ZLG 真机能力只能在 Windows 上验证；非 Windows 只能做结构开发、单元测试和语法检查。
+- ZLG / 同星 真机能力只能在 Windows 上验证；非 Windows 只能做结构开发、单元测试和语法检查。
 - V1 的 `ETH` 主要指 DoIP 诊断链路，不是通用原始以太网帧回放。
 - 在线信号改值依赖 DBC / J1939 DBC；未绑定数据库时不要声称支持信号级编辑。
-- 同星适配器当前仍是占位路径，不要伪造“已支持同星硬件”。
+- 同星适配器已经接入 TSMaster 路径；不要把 Windows 真机能力误写成跨平台已验证。
 - 场景结构必须继续兼容 `ScenarioSpec.from_dict()` / `to_dict()`。
 - 新增 UI 文案默认保持中文。
-- `zlgcan_python_251211/` 只在确有必要时修改。
+- `zlgcan_python_251211/` 与 `TSMasterApi/` 只在确有必要时修改。
 - 不要提交或依赖 `__pycache__` 内容。
 
 ## 3. 改动原则
@@ -59,5 +60,5 @@
 - 是否破坏 `ScenarioSpec` 的 JSON 兼容性
 - 是否新增英文 UI 文案
 - 是否把 Windows 专属能力误写成跨平台可用
-- 是否修改了 ZLG / DoIP 行为却没有补测试或说明限制
+- 是否修改了 ZLG / 同星 / DoIP 行为却没有补测试或说明限制
 - 是否明确写出“已验证 / 未验证”的边界

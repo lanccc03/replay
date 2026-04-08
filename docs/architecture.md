@@ -9,7 +9,7 @@
 1. UI 层：桌面界面、文件导入、场景编辑、回放控制、日志查看
 2. 应用服务层：文件库、场景库、信号覆盖服务、应用控制器
 3. 运行时层：统一逻辑时钟、时间轴调度、链路动作执行、回放状态机
-4. 设备 / 诊断适配层：ZLG、Mock、同星占位、CAN UDS、DoIP、DTC 解析
+4. 设备 / 诊断适配层：ZLG、同星、Mock、CAN UDS、DoIP、DTC 解析
 
 推荐的职责边界：
 
@@ -62,6 +62,8 @@
   DBC / J1939 DBC 绑定，发送前的 `decode -> patch -> encode`。
 - `src/replay_platform/adapters/zlg.py`
   ZLG 设备加载、通道配置、收发、健康检查、底层 UDS DLL 导出入口。
+- `src/replay_platform/adapters/tongxing.py`
+  同星 / TSMaster 设备加载、应用映射、通道配置、收发与健康检查。
 - `src/replay_platform/ui/main_window.py`
   主窗口与二级场景编辑器所在位置；UI 文案默认保持中文。
 
