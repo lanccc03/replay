@@ -128,6 +128,10 @@ class _FakeTsApi:
         self.sent_canfd: list[dict] = []
         self.sent_can_async: list[dict] = []
         self.sent_canfd_async: list[dict] = []
+        self.can_tx_counts: dict[int, list[int]] = {}
+        self.canfd_tx_counts: dict[int, list[int]] = {}
+        self.can_tx_count_reads: list[int] = []
+        self.canfd_tx_count_reads: list[int] = []
         self.can_rx: dict[int, list[_FakeTLIBCAN]] = {}
         self.canfd_rx: dict[int, list[_FakeTLIBCANFD]] = {}
         self.fifo_enabled = False
@@ -228,6 +232,18 @@ class _FakeTsApi:
     def tsfifo_clear_canfd_receive_buffers(self, channel: int) -> int:
         self.clear_calls.append(("canfd", int(channel)))
         self.canfd_rx[int(channel)] = []
+        return 0
+
+    def tsfifo_read_can_tx_buffer_frame_count(self, channel: int, count_ptr) -> int:
+        physical_channel = int(channel)
+        self.can_tx_count_reads.append(physical_channel)
+        _write_int_pointer(count_ptr, self._next_tx_count(self.can_tx_counts, physical_channel))
+        return 0
+
+    def tsfifo_read_canfd_tx_buffer_frame_count(self, channel: int, count_ptr) -> int:
+        physical_channel = int(channel)
+        self.canfd_tx_count_reads.append(physical_channel)
+        _write_int_pointer(count_ptr, self._next_tx_count(self.canfd_tx_counts, physical_channel))
         return 0
 
     def tsapp_transmit_can_async(self, frame_ptr) -> int:
@@ -346,6 +362,19 @@ class _FakeTsApi:
         for index, value in enumerate(payload[:64]):
             frame.FData[index] = value
         self.canfd_rx.setdefault(int(channel), []).append(frame)
+
+    def set_can_tx_counts(self, channel: int, *counts: int) -> None:
+        self.can_tx_counts[int(channel)] = [int(item) for item in counts] or [0]
+
+    def set_canfd_tx_counts(self, channel: int, *counts: int) -> None:
+        self.canfd_tx_counts[int(channel)] = [int(item) for item in counts] or [0]
+
+    @staticmethod
+    def _next_tx_count(counts_by_channel: dict[int, list[int]], channel: int) -> int:
+        counts = counts_by_channel.setdefault(int(channel), [0])
+        if len(counts) <= 1:
+            return counts[0] if counts else 0
+        return counts.pop(0)
 
 
 class _FakeRuntime:
@@ -478,37 +507,62 @@ class TongxingAdapterTests(unittest.TestCase):
 
         self.assertEqual(1, sent)
         self.assertGreaterEqual(runtime.ensure_connected_calls, 2)
-        self.assertEqual(0xC, runtime.ts_api.sent_canfd[0]["dlc"])
-        self.assertEqual(payload, runtime.ts_api.sent_canfd[0]["payload"])
-        self.assertEqual(50, runtime.ts_api.sent_canfd[0]["timeout_ms"])
-        self.assertTrue(runtime.ts_api.sent_canfd[0]["properties"] & 0x04)
-        self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x01)
-        self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x02)
-        self.assertEqual([], runtime.ts_api.sent_canfd_async)
+        self.assertEqual(0xC, runtime.ts_api.sent_canfd_async[0]["dlc"])
+        self.assertEqual(payload, runtime.ts_api.sent_canfd_async[0]["payload"])
+        self.assertTrue(runtime.ts_api.sent_canfd_async[0]["properties"] & 0x04)
+        self.assertTrue(runtime.ts_api.sent_canfd_async[0]["fd_properties"] & 0x01)
+        self.assertTrue(runtime.ts_api.sent_canfd_async[0]["fd_properties"] & 0x02)
+        self.assertEqual([], runtime.ts_api.sent_canfd)
 
     @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
-    def test_send_canfd_sync_timeout_raises_error_and_does_not_fall_back_to_async(self, _platform_system) -> None:
-        binding = self._make_binding(bus_type=BusType.CANFD)
-        api = _FakeTsApi(canfd_sync_error_code=408)
-        adapter, runtime = self._make_adapter(binding, api)
+    def test_send_can_uses_async_api_and_does_not_fall_back_to_sync(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CAN)
+        adapter, runtime = self._make_adapter(binding)
         adapter.start_channel(0, binding.channel_config())
 
         event = FrameEvent(
             ts_ns=456_000,
-            bus_type=BusType.CANFD,
+            bus_type=BusType.CAN,
             channel=0,
-            message_id=0x18DAF110,
-            payload=bytes(range(12)),
-            dlc=0x9,
-            flags={"extended": True},
+            message_id=0x7E0,
+            payload=bytes(range(8)),
+            dlc=8,
+            flags={"extended": False},
         )
 
-        with self.assertRaisesRegex(Exception, "transmit frame on channel 0 failed"):
-            adapter.send([event])
+        sent = adapter.send([event])
 
-        self.assertEqual(1, len(runtime.ts_api.sent_canfd))
-        self.assertEqual(50, runtime.ts_api.sent_canfd[0]["timeout_ms"])
-        self.assertEqual([], runtime.ts_api.sent_canfd_async)
+        self.assertEqual(1, sent)
+        self.assertEqual(1, len(runtime.ts_api.sent_can_async))
+        self.assertEqual(bytes(range(8)), runtime.ts_api.sent_can_async[0]["payload"])
+        self.assertEqual([], runtime.ts_api.sent_can)
+
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_close_drains_pending_canfd_tx_before_release(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CANFD)
+        adapter, runtime = self._make_adapter(binding)
+        adapter.start_channel(0, binding.channel_config())
+        runtime.ts_api.set_canfd_tx_counts(0, 2, 1, 0)
+
+        adapter.close()
+
+        self.assertEqual([0, 0, 0], runtime.ts_api.canfd_tx_count_reads)
+        self.assertEqual(1, runtime.release_calls)
+        self.assertEqual([], runtime.ts_api.sent_canfd)
+
+    @patch("replay_platform.adapters.tongxing._TX_DRAIN_TIMEOUT_MS", 5)
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_close_drain_timeout_still_releases_runtime(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CANFD)
+        adapter, runtime = self._make_adapter(binding)
+        adapter.start_channel(0, binding.channel_config())
+        runtime.ts_api.set_canfd_tx_counts(0, 3)
+
+        adapter.close()
+
+        self.assertGreaterEqual(len(runtime.ts_api.canfd_tx_count_reads), 2)
+        self.assertEqual(1, runtime.release_calls)
+        self.assertEqual([], runtime.ts_api.sent_canfd)
 
     @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
     def test_read_returns_sorted_frames_across_started_channels(self, _platform_system) -> None:

@@ -32,7 +32,8 @@ from replay_platform.errors import ConfigurationError
 _DEFAULT_SDK_ROOT = "TSMasterApi"
 _DEFAULT_FALLBACK_CHANNEL_COUNT = 8
 _MAX_FIFO_READ = 256
-_SYNC_TRANSMIT_TIMEOUT_MS = 50
+_TX_DRAIN_TIMEOUT_MS = 50
+_TX_DRAIN_POLL_INTERVAL_S = 0.001
 
 
 class _TSMasterRuntime:
@@ -303,6 +304,9 @@ class TongxingDeviceAdapter(DeviceAdapter):
 
     def close(self) -> None:
         with self._runtime.lock:
+            if self._opened:
+                self._activate_application_locked()
+                self._drain_pending_tx_locked()
             for physical_channel in list(self._started_channels):
                 self._clear_receive_buffers_locked(physical_channel)
             self._channel_configs.clear()
@@ -576,11 +580,42 @@ class TongxingDeviceAdapter(DeviceAdapter):
     def _transmit_event_locked(self, event: FrameEvent) -> Any:
         if event.bus_type == BusType.CANFD:
             frame = self._build_canfd_frame(event)
-            return self._runtime.ts_api.tsapp_transmit_canfd_sync(byref(frame), _SYNC_TRANSMIT_TIMEOUT_MS)
+            return self._runtime.ts_api.tsapp_transmit_canfd_async(byref(frame))
         if event.bus_type == BusType.ETH:
             raise AdapterOperationError("Tongxing adapter does not support raw ETH replay.")
         frame = self._build_can_frame(event)
-        return self._runtime.ts_api.tsapp_transmit_can_sync(byref(frame), _SYNC_TRANSMIT_TIMEOUT_MS)
+        return self._runtime.ts_api.tsapp_transmit_can_async(byref(frame))
+
+    def _drain_pending_tx_locked(self) -> None:
+        if not self._runtime.connected or not self._started_channels:
+            return
+        deadline = time.monotonic() + (_TX_DRAIN_TIMEOUT_MS / 1000.0)
+        while True:
+            pending = 0
+            for physical_channel in sorted(self._started_channels):
+                bus_type = self._bus_type_for_channel(physical_channel, self.seed_binding.bus_type)
+                pending += self._read_tx_buffer_frame_count_locked(physical_channel, bus_type)
+            if pending <= 0 or time.monotonic() >= deadline:
+                return
+            time.sleep(_TX_DRAIN_POLL_INTERVAL_S)
+
+    def _read_tx_buffer_frame_count_locked(self, physical_channel: int, bus_type: BusType) -> int:
+        getter_name = (
+            "tsfifo_read_canfd_tx_buffer_frame_count"
+            if bus_type == BusType.CANFD
+            else "tsfifo_read_can_tx_buffer_frame_count"
+        )
+        getter = getattr(self._runtime.ts_api, getter_name, None)
+        if getter is None:
+            return 0
+        count = c_int32(0)
+        try:
+            code = getter(physical_channel, byref(count))
+        except Exception:
+            return 0
+        if code not in (0, None):
+            return 0
+        return max(int(count.value), 0)
 
     def _build_can_frame(self, event: FrameEvent):
         frame = self._runtime.ts_struct.TLIBCAN()
