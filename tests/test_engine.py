@@ -61,6 +61,16 @@ class PartialSendMockDeviceAdapter(RecordingMockDeviceAdapter):
         return accepted
 
 
+class CloseRecordingMockDeviceAdapter(MockDeviceAdapter):
+    def __init__(self, adapter_id: str = "mock", channel_count: int = 4) -> None:
+        super().__init__(adapter_id, channel_count=channel_count)
+        self.close_threads: list[str] = []
+
+    def close(self) -> None:
+        self.close_threads.append(threading.current_thread().name)
+        super().close()
+
+
 class SlowDiagnosticClient(DiagnosticClient):
     def __init__(self, delay_s: float = 0.05) -> None:
         self.delay_s = delay_s
@@ -128,6 +138,7 @@ class ReplayEngineTests(unittest.TestCase):
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if engine.state == ReplayState.STOPPED:
+                engine.finalize_completed_replay()
                 return engine
             time.sleep(0.005)
         try:
@@ -282,6 +293,90 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual("done.asc", completed_snapshot.current_source_file)
         self.assertFalse(completed_snapshot.loop_enabled)
         self.assertEqual(0, completed_snapshot.completed_loops)
+
+    def test_completed_replay_defers_adapter_close_until_finalization(self):
+        adapter = CloseRecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-complete-finalize",
+            name="Complete finalize",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=0,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x321,
+                payload=b"\x01",
+                dlc=1,
+            )
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.2,
+            failure_message="自然播放结束后未进入停止状态。",
+        )
+
+        self.assertTrue(engine.has_pending_completion_cleanup())
+        self.assertEqual([], adapter.close_threads)
+
+        self.assertTrue(engine.finalize_completed_replay())
+        self.assertFalse(engine.has_pending_completion_cleanup())
+        self.assertEqual([threading.current_thread().name], adapter.close_threads)
+        self.assertNotIn("replay-engine", adapter.close_threads)
+        self.assertFalse(engine.finalize_completed_replay())
+        self.assertEqual([threading.current_thread().name], adapter.close_threads)
+
+    def test_manual_stop_closes_adapters_without_pending_completion_cleanup(self):
+        adapter = CloseRecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-manual-stop-finalize",
+            name="Manual stop finalize",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(
+                ts_ns=100_000_000,
+                bus_type=BusType.CAN,
+                channel=0,
+                message_id=0x322,
+                payload=b"\x01",
+                dlc=1,
+            )
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        engine.start()
+        time.sleep(0.005)
+
+        engine.stop()
+
+        self.assertFalse(engine.has_pending_completion_cleanup())
+        self.assertEqual([threading.current_thread().name], adapter.close_threads)
+        self.assertFalse(engine.finalize_completed_replay())
+        self.assertEqual([threading.current_thread().name], adapter.close_threads)
 
     def test_loop_playback_restarts_timeline_and_accumulates_stats(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)

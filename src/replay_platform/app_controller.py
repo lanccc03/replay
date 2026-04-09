@@ -187,6 +187,9 @@ class ReplayApplication:
 
     def runtime_snapshot(self) -> ReplayRuntimeSnapshot:
         snapshot = self.engine.snapshot()
+        if snapshot.state == ReplayState.STOPPED and self.engine.has_pending_completion_cleanup():
+            self.engine.finalize_completed_replay()
+            snapshot = self.engine.snapshot()
         if snapshot.state == ReplayState.STOPPED and self._last_runtime_state != ReplayState.STOPPED:
             self.frame_enables.clear_all()
         self._last_runtime_state = snapshot.state

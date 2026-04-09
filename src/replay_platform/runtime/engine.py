@@ -82,7 +82,9 @@ class ReplayEngine:
         self._completed_loops = 0
         self._stats_lock = threading.Lock()
         self._snapshot_lock = threading.Lock()
+        self._completion_cleanup_lock = threading.Lock()
         self._frame_log_counts: Dict[str, int] = {}
+        self._completion_cleanup_pending = False
         self._runtime_snapshot = ReplayRuntimeSnapshot()
 
     def configure(
@@ -95,6 +97,8 @@ class ReplayEngine:
         launch_source: Optional[ReplayLaunchSource] = None,
         loop_enabled: bool = False,
     ) -> None:
+        if self.has_pending_completion_cleanup() and not self.finalize_completed_replay():
+            raise ConfigurationError("上一轮回放尚未完成资源清理，请稍后重试。")
         self._scenario = scenario
         self._timeline = scenario.timeline_items(frames)
         self._adapters = adapters
@@ -169,6 +173,7 @@ class ReplayEngine:
             self._stop_requested = True
             self.state = ReplayState.STOPPED
             self.signal_overrides.clear_all()
+            self._set_completion_cleanup_pending(False)
             self._condition.notify_all()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
@@ -202,6 +207,29 @@ class ReplayEngine:
                 loop_enabled=snapshot.loop_enabled,
                 completed_loops=snapshot.completed_loops,
             )
+
+    def has_pending_completion_cleanup(self) -> bool:
+        with self._completion_cleanup_lock:
+            return self._completion_cleanup_pending
+
+    def finalize_completed_replay(self) -> bool:
+        with self._completion_cleanup_lock:
+            if not self._completion_cleanup_pending:
+                return False
+            self._completion_cleanup_pending = False
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                with self._completion_cleanup_lock:
+                    self._completion_cleanup_pending = True
+                return False
+        self._thread = None
+        self._teardown_adapters()
+        self._update_runtime_snapshot(
+            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+        )
+        return True
 
     def seek_to_start(self) -> None:
         if self.state == ReplayState.RUNNING:
@@ -302,7 +330,7 @@ class ReplayEngine:
         if not self._loop_enabled or not self._timeline:
             self._stop_diagnostic_worker()
             self.state = ReplayState.STOPPED
-            self._teardown_adapters()
+            self._set_completion_cleanup_pending(True)
             self._update_runtime_snapshot(
                 state=self.state,
                 current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
@@ -612,6 +640,10 @@ class ReplayEngine:
                 adapter.close()
             except Exception as exc:  # pragma: no cover - defensive cleanup
                 self._log_warning(f"适配器关闭失败：{exc}")
+
+    def _set_completion_cleanup_pending(self, pending: bool) -> None:
+        with self._completion_cleanup_lock:
+            self._completion_cleanup_pending = pending
 
     def _should_emit(self, level: ReplayLogLevel) -> bool:
         return self.log_config.allows(level)

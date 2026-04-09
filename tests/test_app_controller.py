@@ -24,11 +24,31 @@ from replay_platform.core import (
     ReplayLaunchSource,
     ReplayLogConfig,
     ReplayLogLevel,
+    ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
     TraceFileRecord,
 )
 from replay_platform.ui.main_window import _plan_log_refresh
+
+
+class CompletedReplayEngineStub:
+    def __init__(self) -> None:
+        self._pending_cleanup = True
+        self.finalize_calls = 0
+
+    def snapshot(self) -> ReplayRuntimeSnapshot:
+        return ReplayRuntimeSnapshot(state=ReplayState.STOPPED)
+
+    def has_pending_completion_cleanup(self) -> bool:
+        return self._pending_cleanup
+
+    def finalize_completed_replay(self) -> bool:
+        if not self._pending_cleanup:
+            return False
+        self.finalize_calls += 1
+        self._pending_cleanup = False
+        return True
 
 
 class ReplayApplicationLogTests(unittest.TestCase):
@@ -209,6 +229,21 @@ class ReplayApplicationLogTests(unittest.TestCase):
 
             app.stop_replay()
 
+            self.assertEqual([], app.frame_enables.list_rules())
+
+    def test_runtime_snapshot_finalizes_completed_replay_cleanup_once(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            app.engine = CompletedReplayEngineStub()
+            app.frame_enables.set_rule(FrameEnableRule(logical_channel=0, message_id=0x123, enabled=False))
+            app._last_runtime_state = ReplayState.RUNNING
+
+            first_snapshot = app.runtime_snapshot()
+            second_snapshot = app.runtime_snapshot()
+
+            self.assertEqual(ReplayState.STOPPED, first_snapshot.state)
+            self.assertEqual(ReplayState.STOPPED, second_snapshot.state)
+            self.assertEqual(1, app.engine.finalize_calls)
             self.assertEqual([], app.frame_enables.list_rules())
 
     def test_build_adapters_passes_full_binding_to_tongxing_adapter(self) -> None:
