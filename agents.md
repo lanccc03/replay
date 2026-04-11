@@ -12,6 +12,7 @@
   - `src/replay_platform/runtime/engine.py`
   - `src/replay_platform/ui/main_window.py`
 - 按任务补读：
+  - 复杂功能 / 大型重构 / 方案设计：`.agent/PLANS.md`
   - 场景 / trace / 信号覆盖：`docs/scenario-and-trace.md`
   - 诊断：`docs/diagnostics.md`
   - Windows / ZLG / 同星 硬件边界：`docs/zlg-hardware.md`
@@ -35,6 +36,9 @@
 
 ## 3. 改动原则
 
+- 编写复杂功能或显著重构时，必须先按 `.agent/PLANS.md` 编写 ExecPlan，并从设计、原型验证、实现到交付全程维护。
+- ExecPlan 必须保持自包含、可落地、可验证；执行过程中持续更新 `Progress`、`Surprises & Discoveries`、`Decision Log`、`Outcomes & Retrospective`。
+- 如果需求存在较大未知或风险，先在 ExecPlan 中拆出原型 / 试验性里程碑验证可行性，再推进正式实现。
 - 先沿现有架构扩展，不平白增加新抽象层。
 - 涉及场景结构时，同时检查 `core.py`、UI、持久化、运行时是否要同步。
 - 涉及回放时序时，重点检查：
@@ -47,6 +51,7 @@
 ## 4. 验证与交付
 
 - 详细命令和测试映射统一看 `docs/testing.md`。
+- 若任务采用 ExecPlan，交付前同步更新对应计划文档，确保计划中的进度、决策、验证结论与实际代码一致。
 - 纯文档改动：至少检查路径、模块名、命令与仓库一致。
 - 纯 UI 改动：至少做 `python -m compileall src tests`；若涉及表单解析或场景编辑逻辑，补或更新 `tests/test_ui_helpers.py`。
 - 运行时 / 解析 / 场景结构改动：运行全部 `unittest`，并补对应模块测试。
