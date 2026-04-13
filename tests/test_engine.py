@@ -8,6 +8,7 @@ import tests.bootstrap  # noqa: F401
 from replay_platform.adapters.base import DiagnosticClient
 from replay_platform.adapters.mock import MockDeviceAdapter
 from replay_platform.core import (
+    AdapterCapabilities,
     BusType,
     DeviceChannelBinding,
     DiagnosticAction,
@@ -49,6 +50,34 @@ class RecordingMockDeviceAdapter(MockDeviceAdapter):
     def send_scheduled(self, batch, enqueue_base_ns):
         self.scheduled_call_offsets_ns.append(time.perf_counter_ns() - enqueue_base_ns)
         return super().send_scheduled(batch, enqueue_base_ns)
+
+
+class StartupSyncRecordingMockAdapter(RecordingMockDeviceAdapter):
+    def __init__(
+        self,
+        adapter_id: str = "mock",
+        channel_count: int = 4,
+        *,
+        sync_failure: bool = False,
+    ) -> None:
+        super().__init__(adapter_id, channel_count=channel_count)
+        self.sync_failure = sync_failure
+        self.sync_frames: list[FrameEvent] = []
+        self.sync_call_times_ns: list[int] = []
+        self.sync_timeouts_ms: list[int] = []
+
+    def send_sync(self, event, timeout_ms):
+        self.sync_call_times_ns.append(time.perf_counter_ns())
+        self.sync_timeouts_ms.append(int(timeout_ms))
+        self.sync_frames.append(event.clone())
+        if self.sync_failure:
+            raise RuntimeError("startup-sync-failed")
+        return MockDeviceAdapter.send(self, [event])
+
+    def capabilities(self) -> AdapterCapabilities:
+        capabilities = super().capabilities()
+        capabilities.sync_send = True
+        return capabilities
 
 
 class PartialSendMockDeviceAdapter(RecordingMockDeviceAdapter):
@@ -1257,6 +1286,147 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(1, len(adapter.scheduled_batches))
         self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.scheduled_batches[0]])
         self.assertGreaterEqual(adapter.scheduled_call_offsets_ns[0], 18_000_000)
+
+    def test_startup_sync_reanchors_after_delayed_start(self):
+        adapter = StartupSyncRecordingMockAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-startup-sync-reanchor",
+            name="Startup sync reanchor",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=100_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        self._delay_first_runtime_snapshot(engine, 0.03)
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.5,
+            failure_message="startup sync 重锚点用例未在预期时间内结束。",
+        )
+        engine.finalize_completed_replay()
+
+        self.assertEqual([0x100], [frame.message_id for frame in adapter.sync_frames])
+        self.assertEqual([100], adapter.sync_timeouts_ms)
+        self.assertEqual(1, len(adapter.send_batches))
+        self.assertEqual([0x101], [frame.message_id for frame in adapter.send_batches[0]])
+        send_gap_ns = adapter.send_call_times_ns[0] - adapter.sync_call_times_ns[0]
+        self.assertGreaterEqual(send_gap_ns, 85_000_000)
+        self.assertLess(send_gap_ns, 160_000_000)
+
+    def test_startup_sync_splits_initial_2ms_batch(self):
+        adapter = StartupSyncRecordingMockAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-startup-sync-split-batch",
+            name="Startup sync split batch",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=1_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+
+        engine = self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+
+        self.assertEqual([0x100], [frame.message_id for frame in adapter.sync_frames])
+        self.assertEqual(1, len(adapter.send_batches))
+        self.assertEqual([0x101], [frame.message_id for frame in adapter.send_batches[0]])
+        self.assertGreater(adapter.send_call_times_ns[0], adapter.sync_call_times_ns[0])
+        self.assertEqual(2, engine.stats.sent_frames)
+        self.assertEqual(0, engine.stats.skipped_frames)
+
+    def test_startup_sync_uses_first_enabled_frame_when_batch_head_is_disabled(self):
+        adapter = StartupSyncRecordingMockAdapter("mock-1", channel_count=1)
+        frame_enables = FrameEnableService()
+        frame_enables.set_rule(FrameEnableRule(logical_channel=0, message_id=0x100, enabled=False))
+        scenario = ScenarioSpec(
+            scenario_id="s-startup-sync-disabled-head",
+            name="Startup sync disabled head",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=1_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+
+        engine = self._run_engine_to_completion(
+            scenario,
+            frames,
+            {"mock-1": adapter},
+            frame_enables=frame_enables,
+        )
+
+        self.assertEqual([0x101], [frame.message_id for frame in adapter.sync_frames])
+        self.assertEqual([], adapter.send_batches)
+        self.assertEqual(1, engine.stats.sent_frames)
+        self.assertEqual(1, engine.stats.skipped_frames)
+
+    def test_startup_sync_failure_falls_back_to_async_batch_send(self):
+        adapter = StartupSyncRecordingMockAdapter("mock-1", channel_count=1, sync_failure=True)
+        scenario = ScenarioSpec(
+            scenario_id="s-startup-sync-fallback",
+            name="Startup sync fallback",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+        logs: list[str] = []
+
+        engine = self._run_engine_to_completion(
+            scenario,
+            frames,
+            {"mock-1": adapter},
+            logger=logs.append,
+        )
+
+        self.assertEqual([0x100], [frame.message_id for frame in adapter.sync_frames])
+        self.assertEqual(1, len(adapter.send_batches))
+        self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.send_batches[0]])
+        self.assertTrue(any("startup-sync-failed" in entry for entry in logs))
+        self.assertEqual(2, engine.stats.sent_frames)
+        self.assertEqual(0, engine.stats.skipped_frames)
 
     def test_single_enabled_frame_in_batch_falls_back_to_immediate_send(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=2)

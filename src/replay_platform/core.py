@@ -98,6 +98,7 @@ class AdapterCapabilities:
     j1939: bool = False
     merge_receive: bool = False
     queue_send: bool = False
+    sync_send: bool = False
     tx_timestamp: bool = False
     bus_usage: bool = False
     can_uds: bool = False

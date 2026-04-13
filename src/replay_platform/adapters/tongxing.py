@@ -34,6 +34,7 @@ _DEFAULT_FALLBACK_CHANNEL_COUNT = 8
 _MAX_FIFO_READ = 256
 _TX_DRAIN_TIMEOUT_MS = 50
 _TX_DRAIN_POLL_INTERVAL_S = 0.001
+_SYNC_SEND_TIMEOUT_MS = 100
 
 
 class _TSMasterRuntime:
@@ -387,6 +388,16 @@ class TongxingDeviceAdapter(DeviceAdapter):
                 raise self._build_operation_error(code, f"transmit frame on channel {event.channel}")
         return sent
 
+    def send_sync(self, event: FrameEvent, timeout_ms: int = _SYNC_SEND_TIMEOUT_MS) -> int:
+        self.open()
+        with self._runtime.lock:
+            self._activate_application_locked()
+            self._runtime.ensure_connected()
+            self._ensure_channel_started(event.channel)
+            code = self._transmit_event_sync_locked(event, timeout_ms)
+            self._check_code(code, f"sync transmit frame on channel {event.channel}")
+        return 1
+
     def read(self, limit: int = 256, timeout_ms: int = 0) -> List[FrameEvent]:
         if limit <= 0 or not self._started_channels:
             return []
@@ -434,6 +445,7 @@ class TongxingDeviceAdapter(DeviceAdapter):
             can=True,
             canfd=True,
             j1939=True,
+            sync_send=True,
             can_uds=True,
         )
 
@@ -585,6 +597,15 @@ class TongxingDeviceAdapter(DeviceAdapter):
             raise AdapterOperationError("Tongxing adapter does not support raw ETH replay.")
         frame = self._build_can_frame(event)
         return self._runtime.ts_api.tsapp_transmit_can_async(byref(frame))
+
+    def _transmit_event_sync_locked(self, event: FrameEvent, timeout_ms: int) -> Any:
+        if event.bus_type == BusType.CANFD:
+            frame = self._build_canfd_frame(event)
+            return self._runtime.ts_api.tsapp_transmit_canfd_sync(byref(frame), int(timeout_ms))
+        if event.bus_type == BusType.ETH:
+            raise AdapterOperationError("Tongxing adapter does not support raw ETH replay.")
+        frame = self._build_can_frame(event)
+        return self._runtime.ts_api.tsapp_transmit_can_sync(byref(frame), int(timeout_ms))
 
     def _drain_pending_tx_locked(self) -> None:
         if not self._runtime.connected or not self._started_channels:

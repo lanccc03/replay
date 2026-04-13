@@ -10,6 +10,7 @@ import tests.bootstrap  # noqa: F401
 
 from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.core import BusType, ChannelConfig, DeviceChannelBinding, FrameEvent
+from replay_platform.errors import AdapterOperationError
 
 
 _DLC_DATA_BYTE_CNT = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
@@ -536,6 +537,79 @@ class TongxingAdapterTests(unittest.TestCase):
         self.assertEqual(1, len(runtime.ts_api.sent_can_async))
         self.assertEqual(bytes(range(8)), runtime.ts_api.sent_can_async[0]["payload"])
         self.assertEqual([], runtime.ts_api.sent_can)
+
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_send_sync_can_uses_sync_api(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CAN)
+        adapter, runtime = self._make_adapter(binding)
+        adapter.start_channel(0, binding.channel_config())
+
+        event = FrameEvent(
+            ts_ns=789_000,
+            bus_type=BusType.CAN,
+            channel=0,
+            message_id=0x7E0,
+            payload=bytes(range(8)),
+            dlc=8,
+            flags={"extended": False},
+        )
+
+        sent = adapter.send_sync(event, timeout_ms=77)
+
+        self.assertEqual(1, sent)
+        self.assertEqual(1, len(runtime.ts_api.sent_can))
+        self.assertEqual(77, runtime.ts_api.sent_can[0]["timeout_ms"])
+        self.assertEqual(bytes(range(8)), runtime.ts_api.sent_can[0]["payload"])
+        self.assertEqual([], runtime.ts_api.sent_can_async)
+
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_send_sync_canfd_uses_sync_api(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CANFD)
+        adapter, runtime = self._make_adapter(binding)
+        adapter.start_channel(0, binding.channel_config())
+
+        payload = bytes(range(24))
+        event = FrameEvent(
+            ts_ns=321_000,
+            bus_type=BusType.CANFD,
+            channel=0,
+            message_id=0x18DAF110,
+            payload=payload,
+            dlc=0xF,
+            flags={"brs": True, "extended": True},
+        )
+
+        sent = adapter.send_sync(event, timeout_ms=55)
+
+        self.assertEqual(1, sent)
+        self.assertEqual(1, len(runtime.ts_api.sent_canfd))
+        self.assertEqual(55, runtime.ts_api.sent_canfd[0]["timeout_ms"])
+        self.assertEqual(0xC, runtime.ts_api.sent_canfd[0]["dlc"])
+        self.assertEqual(payload, runtime.ts_api.sent_canfd[0]["payload"])
+        self.assertTrue(runtime.ts_api.sent_canfd[0]["properties"] & 0x04)
+        self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x01)
+        self.assertTrue(runtime.ts_api.sent_canfd[0]["fd_properties"] & 0x02)
+        self.assertEqual([], runtime.ts_api.sent_canfd_async)
+
+    @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
+    def test_send_sync_raises_when_sync_api_reports_error(self, _platform_system) -> None:
+        binding = self._make_binding(bus_type=BusType.CAN)
+        api = _FakeTsApi(can_sync_error_code=42)
+        adapter, _runtime = self._make_adapter(binding, api)
+        adapter.start_channel(0, binding.channel_config())
+
+        event = FrameEvent(
+            ts_ns=456_000,
+            bus_type=BusType.CAN,
+            channel=0,
+            message_id=0x7E0,
+            payload=bytes(range(8)),
+            dlc=8,
+            flags={"extended": False},
+        )
+
+        with self.assertRaisesRegex(AdapterOperationError, "sync transmit frame"):
+            adapter.send_sync(event, timeout_ms=33)
 
     @patch("replay_platform.adapters.tongxing.platform.system", return_value="Windows")
     def test_close_drains_pending_canfd_tx_before_release(self, _platform_system) -> None:

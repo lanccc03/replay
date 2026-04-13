@@ -43,6 +43,10 @@ class DeviceAdapter(ABC):
     def send(self, batch: Sequence[FrameEvent]) -> int:
         raise NotImplementedError
 
+    def send_sync(self, event: FrameEvent, timeout_ms: int) -> int:
+        _ = timeout_ms
+        return self.send([event])
+
     def send_scheduled(self, batch: Sequence[FrameEvent], enqueue_base_ns: int) -> int:
         return self.send(batch)
 
