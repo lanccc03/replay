@@ -748,6 +748,99 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(1, engine.stats.sent_frames)
         self.assertEqual(1, engine.stats.skipped_frames)
 
+    def test_prepare_frame_groups_maps_enabled_frames_by_adapter_and_skips_disabled_frames(self):
+        signal_overrides = SignalOverrideService()
+        signal_overrides.bind_codec(
+            0,
+            StaticMessageCodec(
+                {
+                    0x100: StaticMessageDefinition(
+                        name="Msg100",
+                        signal_bytes={"speed": 0},
+                    )
+                }
+            ),
+        )
+        signal_overrides.set_override(
+            SignalOverride(
+                logical_channel=0,
+                message_id_or_pgn=0x100,
+                signal_name="speed",
+                value=0x7F,
+            )
+        )
+        frame_enables = FrameEnableService()
+        frame_enables.set_rule(FrameEnableRule(logical_channel=2, message_id=0x300, enabled=False))
+        scenario = ScenarioSpec(
+            scenario_id="s-prepare-groups",
+            name="Prepare groups",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=2,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                ),
+                DeviceChannelBinding(
+                    adapter_id="mock-2",
+                    driver="mock",
+                    logical_channel=1,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                ),
+                DeviceChannelBinding(
+                    adapter_id="mock-2",
+                    driver="mock",
+                    logical_channel=2,
+                    physical_channel=1,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                ),
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=500_000, bus_type=BusType.CAN, channel=1, message_id=0x200, payload=b"\x02", dlc=1),
+            FrameEvent(ts_ns=1_000_000, bus_type=BusType.CAN, channel=2, message_id=0x300, payload=b"\x03", dlc=1),
+        ]
+        engine = ReplayEngine(
+            signal_overrides=signal_overrides,
+            frame_enables=frame_enables,
+        )
+        engine.configure(
+            scenario,
+            frames,
+            {
+                "mock-1": MockDeviceAdapter("mock-1", channel_count=3),
+                "mock-2": MockDeviceAdapter("mock-2", channel_count=2),
+            },
+            {},
+        )
+
+        groups = engine._prepare_frame_groups(frames)
+
+        self.assertEqual({"mock-1", "mock-2"}, set(groups))
+        self.assertEqual(1, len(groups["mock-1"]))
+        self.assertEqual(1, len(groups["mock-2"]))
+
+        prepared_a = groups["mock-1"][0]
+        self.assertEqual(0, prepared_a.logical_channel)
+        self.assertEqual(2, prepared_a.physical_channel)
+        self.assertEqual(2, prepared_a.frame.channel)
+        self.assertEqual(b"\x7F", prepared_a.frame.payload)
+
+        prepared_b = groups["mock-2"][0]
+        self.assertEqual(1, prepared_b.logical_channel)
+        self.assertEqual(0, prepared_b.physical_channel)
+        self.assertEqual(0, prepared_b.frame.channel)
+        self.assertEqual(b"\x02", prepared_b.frame.payload)
+
+        self.assertEqual(0, engine.stats.sent_frames)
+        self.assertEqual(1, engine.stats.skipped_frames)
+
     def test_frames_at_2ms_boundary_are_split_into_two_batches(self):
         adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
         scenario = ScenarioSpec(

@@ -108,6 +108,7 @@ replay/
 - [`docs/diagnostics.md`](docs/diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
 - [`docs/windows-hardware.md`](docs/windows-hardware.md)：Windows / ZLG / 同星 环境准备、发送路径注意事项、已知限制、联调顺序
 - [`docs/testing.md`](docs/testing.md)：验证命令、测试映射、最低验证要求与验证边界
+- [`docs/text-encoding.md`](docs/text-encoding.md)：中文源码乱码的排查步骤、Windows 终端编码注意事项与预防约定
 
 如果你是在本仓库中执行改动任务的工程代理，请额外阅读：
 

@@ -517,10 +517,10 @@ class ReplayEngine:
         first_enabled_frame = frames[first_enabled_index]
         binding = self._binding_for(first_enabled_frame.channel)
         if binding is None:
-            raise ConfigurationError(f"閫昏緫閫氶亾 {first_enabled_frame.channel} 鏈粦瀹氳澶囥€?")
+            raise ConfigurationError(f"逻辑通道 {first_enabled_frame.channel} 未绑定设备。")
         adapter = self._adapters.get(binding.adapter_id)
         if adapter is None:
-            raise ConfigurationError(f"閫傞厤鍣?{binding.adapter_id} 鏈厤缃€?")
+            raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
         if not adapter.capabilities().sync_send:
             self._startup_sync_pending = False
             return None
@@ -535,12 +535,12 @@ class ReplayEngine:
             self._startup_sync_pending = False
             self._startup_sync_force_immediate_batch = True
             self._record_error(str(exc))
-            self._log_warning(f"鍥炴斁棣栧抚鍚屾鍙戦€佸け璐ワ紝宸插洖閫€鍒板紓姝ヨ矾寰勶細{exc}")
+            self._log_warning(f"回放首帧同步发送失败，已回退到常规批量发送：{exc}")
             return None
         self._startup_sync_pending = False
         if sent <= 0:
             self._startup_sync_force_immediate_batch = True
-            self._log_warning("鍥炴斁棣栧抚鍚屾鍙戦€佹湭瀹屾垚锛屽凡鍥為€€鍒板紓姝ヨ矾寰勩€?")
+            self._log_warning("回放首帧同步发送未完成，已回退到常规批量发送。")
             return None
         if first_enabled_index:
             self._add_skipped_frames(first_enabled_index)
@@ -548,7 +548,7 @@ class ReplayEngine:
         self._base_perf_ns = time.perf_counter_ns() - first_enabled_frame.ts_ns
         self._log_sent_frame(prepared)
         self._log_debug(
-            f"鍥炴斁棣栧抚鍚屾瀵归綈锛歍={first_enabled_frame.ts_ns / 1_000_000:.3f} ms"
+            f"回放首帧同步对齐：T={first_enabled_frame.ts_ns / 1_000_000:.3f} ms"
         )
         return first_enabled_index + 1
 
@@ -561,7 +561,7 @@ class ReplayEngine:
     def _prepare_enabled_frame(self, frame: FrameEvent) -> PreparedFrame:
         binding = self._binding_for(frame.channel)
         if binding is None:
-            raise ConfigurationError(f"閫昏緫閫氶亾 {frame.channel} 鏈粦瀹氳澶囥€?")
+            raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
         mapped = self.signal_overrides.apply(frame)
         mapped = mapped.clone(channel=binding.physical_channel)
         return PreparedFrame(
@@ -579,20 +579,6 @@ class ReplayEngine:
                 continue
             prepared = self._prepare_enabled_frame(frame)
             frames_by_adapter.setdefault(prepared.adapter_id, []).append(prepared)
-            continue
-            binding = self._binding_for(frame.channel)
-            if binding is None:
-                raise ConfigurationError(f"逻辑通道 {frame.channel} 未绑定设备。")
-            mapped = self.signal_overrides.apply(frame)
-            mapped = mapped.clone(channel=binding.physical_channel)
-            frames_by_adapter.setdefault(binding.adapter_id, []).append(
-                PreparedFrame(
-                    adapter_id=binding.adapter_id,
-                    logical_channel=frame.channel,
-                    physical_channel=binding.physical_channel,
-                    frame=mapped,
-                )
-            )
         return frames_by_adapter
 
     def _send_prepared_frames(

@@ -20,3 +20,4 @@
 - [`diagnostics.md`](./diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
 - [`windows-hardware.md`](./windows-hardware.md)：Windows / ZLG / 同星 环境准备、发送路径注意事项、已知限制、联调顺序
 - [`testing.md`](./testing.md)：验证命令、测试映射、最低验证要求与验证边界
+- [`text-encoding.md`](./text-encoding.md)：Windows / PowerShell 下中文源码乱码的排查顺序、判断标准与预防约定
