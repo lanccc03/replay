@@ -76,6 +76,8 @@ class ReplayEngine:
         self._diagnostic_stop_requested = False
         self._diagnostic_active = False
         self._base_perf_ns = 0
+        self._start_request_perf_ns = 0
+        self._start_anchor_pending = False
         self._pause_started_ns = 0
         self._timeline_index = 0
         self._loop_enabled = False
@@ -106,6 +108,10 @@ class ReplayEngine:
         self._timeline_index = 0
         self._loop_enabled = bool(loop_enabled)
         self._completed_loops = 0
+        self._base_perf_ns = 0
+        self._start_request_perf_ns = 0
+        self._start_anchor_pending = False
+        self._pause_started_ns = 0
         self.stats = ReplayStats()
         self._frame_log_counts.clear()
         with self._diagnostic_condition:
@@ -132,7 +138,7 @@ class ReplayEngine:
         self._stop_requested = False
         self._start_diagnostic_worker()
         self.state = ReplayState.RUNNING
-        self._base_perf_ns = time.perf_counter_ns()
+        self._arm_start_anchor()
         self._update_runtime_snapshot(
             state=self.state,
             adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
@@ -159,7 +165,11 @@ class ReplayEngine:
             if self.state != ReplayState.PAUSED:
                 return
             now = time.perf_counter_ns()
-            self._base_perf_ns += now - self._pause_started_ns
+            paused_duration_ns = now - self._pause_started_ns
+            if self._start_anchor_pending and self._start_request_perf_ns:
+                self._start_request_perf_ns += paused_duration_ns
+            else:
+                self._base_perf_ns += paused_duration_ns
             self.state = ReplayState.RUNNING
             self._condition.notify_all()
         self._update_runtime_snapshot(
@@ -174,6 +184,8 @@ class ReplayEngine:
             self.state = ReplayState.STOPPED
             self.signal_overrides.clear_all()
             self._set_completion_cleanup_pending(False)
+            self._clear_start_anchor()
+            self._pause_started_ns = 0
             self._condition.notify_all()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
@@ -235,7 +247,13 @@ class ReplayEngine:
         if self.state == ReplayState.RUNNING:
             raise ConfigurationError("请先停止或暂停回放，再回到起点。")
         self._timeline_index = 0
-        self._base_perf_ns = time.perf_counter_ns()
+        if self.state == ReplayState.PAUSED:
+            now_ns = time.perf_counter_ns()
+            self._pause_started_ns = now_ns
+            self._arm_start_anchor(now_ns)
+        else:
+            self._base_perf_ns = time.perf_counter_ns()
+            self._clear_start_anchor()
         self._log_info("回放位置已重置。")
 
     def _prepare_channels(self) -> None:
@@ -298,8 +316,8 @@ class ReplayEngine:
             item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
             advance_count = len(frame_batch) if frame_batch else 1
             self._update_runtime_snapshot_for_item(item, self._timeline_index)
+            now_ns = self._bind_start_anchor_if_needed()
             target_ns = self._base_perf_ns + item.ts_ns
-            now_ns = time.perf_counter_ns()
             if frame_batch and self._should_schedule_frame_batch(frame_batch, now_ns):
                 try:
                     self._dispatch_frame_batch(frame_batch, scheduled=True)
@@ -330,6 +348,8 @@ class ReplayEngine:
         if not self._loop_enabled or not self._timeline:
             self._stop_diagnostic_worker()
             self.state = ReplayState.STOPPED
+            self._clear_start_anchor()
+            self._pause_started_ns = 0
             self._set_completion_cleanup_pending(True)
             self._update_runtime_snapshot(
                 state=self.state,
@@ -346,6 +366,8 @@ class ReplayEngine:
             self._log_warning(f"循环回放重启失败：{exc}")
             self._stop_diagnostic_worker()
             self.state = ReplayState.STOPPED
+            self._clear_start_anchor()
+            self._pause_started_ns = 0
             self._teardown_adapters()
             self._update_runtime_snapshot(
                 state=self.state,
@@ -362,7 +384,7 @@ class ReplayEngine:
         self._teardown_adapters()
         self._prepare_channels()
         self._timeline_index = 0
-        self._base_perf_ns = time.perf_counter_ns()
+        self._arm_start_anchor()
         self._frame_log_counts.clear()
         self._update_runtime_snapshot(
             state=self.state,
@@ -644,6 +666,26 @@ class ReplayEngine:
     def _set_completion_cleanup_pending(self, pending: bool) -> None:
         with self._completion_cleanup_lock:
             self._completion_cleanup_pending = pending
+
+    def _arm_start_anchor(self, request_perf_ns: Optional[int] = None) -> None:
+        self._start_request_perf_ns = request_perf_ns if request_perf_ns is not None else time.perf_counter_ns()
+        self._start_anchor_pending = True
+
+    def _clear_start_anchor(self) -> None:
+        self._start_request_perf_ns = 0
+        self._start_anchor_pending = False
+
+    def _bind_start_anchor_if_needed(self) -> int:
+        now_ns = time.perf_counter_ns()
+        if not self._start_anchor_pending:
+            return now_ns
+        request_perf_ns = self._start_request_perf_ns
+        self._base_perf_ns = now_ns
+        self._clear_start_anchor()
+        if request_perf_ns:
+            startup_delay_ms = max(now_ns - request_perf_ns, 0) / 1_000_000
+            self._log_debug(f"回放启动延迟：{startup_delay_ms:.3f} ms")
+        return now_ns
 
     def _should_emit(self, level: ReplayLogLevel) -> bool:
         return self.log_config.allows(level)

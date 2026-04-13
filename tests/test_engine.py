@@ -38,9 +38,11 @@ class RecordingMockDeviceAdapter(MockDeviceAdapter):
     def __init__(self, adapter_id: str = "mock", channel_count: int = 4) -> None:
         super().__init__(adapter_id, channel_count=channel_count)
         self.send_batches: list[list[FrameEvent]] = []
+        self.send_call_times_ns: list[int] = []
         self.scheduled_call_offsets_ns: list[int] = []
 
     def send(self, batch):
+        self.send_call_times_ns.append(time.perf_counter_ns())
         self.send_batches.append([item.clone() for item in batch])
         return super().send(batch)
 
@@ -145,6 +147,19 @@ class ReplayEngineTests(unittest.TestCase):
             engine.stop()
         finally:
             self.fail("回放未在预期时间内结束。")
+
+    @staticmethod
+    def _delay_first_runtime_snapshot(engine: ReplayEngine, delay_s: float) -> None:
+        original = engine._update_runtime_snapshot_for_item
+        state = {"delayed": False}
+
+        def delayed_update(item, timeline_index):
+            if not state["delayed"]:
+                state["delayed"] = True
+                time.sleep(delay_s)
+            return original(item, timeline_index)
+
+        engine._update_runtime_snapshot_for_item = delayed_update  # type: ignore[assignment]
 
     def test_start_only_opens_bound_device_channels(self):
         adapter = MockDeviceAdapter("mock-1", channel_count=4)
@@ -1160,6 +1175,85 @@ class ReplayEngineTests(unittest.TestCase):
             FrameEvent(ts_ns=21_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
         ]
         self._run_engine_to_completion(scenario, frames, {"mock-1": adapter})
+        self.assertEqual(1, len(adapter.scheduled_batches))
+        self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.scheduled_batches[0]])
+        self.assertGreaterEqual(adapter.scheduled_call_offsets_ns[0], 18_000_000)
+
+    def test_startup_delay_keeps_original_frame_spacing(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-startup-anchor-spacing",
+            name="Startup anchor spacing",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=100_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+        logs: list[str] = []
+        engine = ReplayEngine(
+            signal_overrides=SignalOverrideService(),
+            logger=logs.append,
+            log_config=ReplayLogConfig(level=ReplayLogLevel.DEBUG),
+        )
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        self._delay_first_runtime_snapshot(engine, 0.03)
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.5,
+            failure_message="启动延迟回归用例未在预期时间内结束。",
+        )
+        engine.finalize_completed_replay()
+
+        self.assertEqual(2, len(adapter.send_call_times_ns))
+        send_gap_ns = adapter.send_call_times_ns[1] - adapter.send_call_times_ns[0]
+        self.assertGreaterEqual(send_gap_ns, 85_000_000)
+        self.assertLess(send_gap_ns, 160_000_000)
+        self.assertTrue(any("回放启动延迟：" in entry for entry in logs))
+
+    def test_startup_delay_still_allows_scheduled_send(self):
+        adapter = RecordingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-scheduled-send-delayed-start",
+            name="Scheduled send delayed start",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=20_000_000, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=21_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        self._delay_first_runtime_snapshot(engine, 0.03)
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.3,
+            failure_message="延迟启动的 scheduled send 用例未在预期时间内结束。",
+        )
+        engine.finalize_completed_replay()
+
         self.assertEqual(1, len(adapter.scheduled_batches))
         self.assertEqual([0x100, 0x101], [frame.message_id for frame in adapter.scheduled_batches[0]])
         self.assertGreaterEqual(adapter.scheduled_call_offsets_ns[0], 18_000_000)
