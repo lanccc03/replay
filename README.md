@@ -74,9 +74,9 @@ python -m unittest discover -s tests -v
 - `database_bindings.path`
 - `diagnostic_targets.host`
 
-ZLG 真机接入前的准备与限制说明见 [`docs/zlg-hardware.md`](docs/zlg-hardware.md)。
+ZLG 真机接入前的准备与限制说明见 [`docs/windows-hardware.md`](docs/windows-hardware.md)。
 
-同星设备当前没有单独示例场景，可在场景编辑器中选择 `driver=tongxing` 后按实际型号配置绑定；相关环境与字段说明同样见 [`docs/zlg-hardware.md`](docs/zlg-hardware.md)。
+同星设备当前没有单独示例场景，可在场景编辑器中选择 `driver=tongxing` 后按实际型号配置绑定；相关环境与字段说明同样见 [`docs/windows-hardware.md`](docs/windows-hardware.md)。
 
 ## 4. 目录概览
 
@@ -106,7 +106,7 @@ replay/
 - [`docs/architecture.md`](docs/architecture.md)：分层架构、核心模块职责、统一时间轴模型
 - [`docs/scenario-and-trace.md`](docs/scenario-and-trace.md)：场景 JSON、trace 导入、信号覆盖、运行数据目录
 - [`docs/diagnostics.md`](docs/diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
-- [`docs/zlg-hardware.md`](docs/zlg-hardware.md)：Windows / ZLG / 同星 环境准备、已知限制、联调顺序
+- [`docs/windows-hardware.md`](docs/windows-hardware.md)：Windows / ZLG / 同星 环境准备、发送路径注意事项、已知限制、联调顺序
 - [`docs/testing.md`](docs/testing.md)：验证命令、测试映射、最低验证要求与验证边界
 
 如果你是在本仓库中执行改动任务的工程代理，请额外阅读：

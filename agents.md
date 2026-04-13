@@ -15,7 +15,7 @@
   - 复杂功能 / 大型重构 / 方案设计：`.agent/PLANS.md`
   - 场景 / trace / 信号覆盖：`docs/scenario-and-trace.md`
   - 诊断：`docs/diagnostics.md`
-  - Windows / ZLG / 同星 硬件边界：`docs/zlg-hardware.md`
+  - Windows / ZLG / 同星 硬件边界：`docs/windows-hardware.md`
   - 验证要求：`docs/testing.md`
   - Trace 导入：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
   - DBC / 信号覆盖：`src/replay_platform/services/signal_catalog.py`
@@ -29,6 +29,7 @@
 - V1 的 `ETH` 主要指 DoIP 诊断链路，不是通用原始以太网帧回放。
 - 在线信号改值依赖 DBC / J1939 DBC；未绑定数据库时不要声称支持信号级编辑。
 - 同星适配器已经接入 TSMaster 路径；不要把 Windows 真机能力误写成跨平台已验证。
+- 如果用户让你分析回放偏差或发送性能问题，先把以下结论当成已排查前提：切换到 `sync` 发送不行；调整 2ms 切片内的帧间隔也不行。除非拿到新的代码证据或 Windows 真机证据，否则不要重复把这两个方向当主方案。
 - 场景结构必须继续兼容 `ScenarioSpec.from_dict()` / `to_dict()`。
 - 新增 UI 文案默认保持中文。
 - `zlgcan_python_251211/` 与 `TSMasterApi/` 只在确有必要时修改。
