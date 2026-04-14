@@ -38,8 +38,12 @@ from replay_platform.services.signal_catalog import SignalOverrideService
 FRAME_SLICE_WINDOW_NS = 2_000_000
 FRAME_SCHEDULE_WINDOW_NS = FRAME_SLICE_WINDOW_NS
 STARTUP_SYNC_TIMEOUT_MS = 100
+STARTUP_SYNC_MESSAGE_ID = 0x1
+STARTUP_SYNC_DLC = 8
+STARTUP_SYNC_PAYLOAD = b"\x00" * STARTUP_SYNC_DLC
 FRAME_LOG_BUS_TYPES = frozenset({BusType.CAN, BusType.CANFD, BusType.J1939})
 SCHEDULED_FRAME_BUS_TYPES = frozenset({BusType.CAN, BusType.J1939})
+STARTUP_SYNC_BUS_TYPES = FRAME_LOG_BUS_TYPES
 
 
 @dataclass(frozen=True)
@@ -80,7 +84,6 @@ class ReplayEngine:
         self._start_request_perf_ns = 0
         self._start_anchor_pending = False
         self._startup_sync_pending = False
-        self._startup_sync_force_immediate_batch = False
         self._pause_started_ns = 0
         self._timeline_index = 0
         self._loop_enabled = False
@@ -115,7 +118,6 @@ class ReplayEngine:
         self._start_request_perf_ns = 0
         self._start_anchor_pending = False
         self._startup_sync_pending = False
-        self._startup_sync_force_immediate_batch = False
         self._pause_started_ns = 0
         self.stats = ReplayStats()
         self._frame_log_counts.clear()
@@ -145,7 +147,6 @@ class ReplayEngine:
         self.state = ReplayState.RUNNING
         self._arm_start_anchor()
         self._startup_sync_pending = True
-        self._startup_sync_force_immediate_batch = False
         self._update_runtime_snapshot(
             state=self.state,
             adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
@@ -193,7 +194,6 @@ class ReplayEngine:
             self._set_completion_cleanup_pending(False)
             self._clear_start_anchor()
             self._startup_sync_pending = False
-            self._startup_sync_force_immediate_batch = False
             self._pause_started_ns = 0
             self._condition.notify_all()
         if self._thread and self._thread.is_alive():
@@ -317,34 +317,24 @@ class ReplayEngine:
                 if self.state == ReplayState.PAUSED:
                     self._condition.wait(timeout=0.1)
                     continue
-            if self._timeline_index >= len(self._timeline):
+            frame_batch: List[FrameEvent] = []
+            item: Optional[TimelineItem] = None
+            advance_count = 0
+            if self._timeline_index < len(self._timeline):
+                frame_batch = self._frame_batch_at(self._timeline_index)
+                item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
+                advance_count = len(frame_batch) if frame_batch else 1
+                self._update_runtime_snapshot_for_item(item, self._timeline_index)
+            now_ns = self._bind_start_anchor_if_needed()
+            if self._startup_sync_pending:
+                self._handle_startup_sync()
+                now_ns = time.perf_counter_ns()
+            if item is None:
                 if not self._handle_timeline_exhausted():
                     return
                 continue
-            frame_batch = self._frame_batch_at(self._timeline_index)
-            item = frame_batch[0] if frame_batch else self._timeline[self._timeline_index]
-            advance_count = len(frame_batch) if frame_batch else 1
-            self._update_runtime_snapshot_for_item(item, self._timeline_index)
-            now_ns = self._bind_start_anchor_if_needed()
-            if frame_batch and self._startup_sync_pending:
-                startup_sync_advance = self._handle_startup_sync(frame_batch, now_ns)
-                if startup_sync_advance == 0:
-                    continue
-                if startup_sync_advance is not None:
-                    self._timeline_index += startup_sync_advance
-                    continue
-                now_ns = time.perf_counter_ns()
-            if frame_batch and self._startup_sync_force_immediate_batch:
-                self._startup_sync_force_immediate_batch = False
-                try:
-                    self._dispatch_frame_batch(frame_batch)
-                except Exception as exc:  # pragma: no cover - defensive runtime logging
-                    self._record_error(str(exc))
-                    self._log_warning(f"回放异常：{exc}")
-                finally:
-                    self._timeline_index += advance_count
-                continue
-            target_ns = self._base_perf_ns + item.ts_ns
+            target_ts_ns = self._frame_dispatch_ts_ns(frame_batch) if frame_batch else item.ts_ns
+            target_ns = self._base_perf_ns + target_ts_ns
             if frame_batch and self._should_schedule_frame_batch(frame_batch, now_ns):
                 try:
                     self._dispatch_frame_batch(frame_batch, scheduled=True)
@@ -413,7 +403,6 @@ class ReplayEngine:
         self._timeline_index = 0
         self._arm_start_anchor()
         self._startup_sync_pending = True
-        self._startup_sync_force_immediate_batch = False
         self._frame_log_counts.clear()
         self._update_runtime_snapshot(
             state=self.state,
@@ -510,53 +499,92 @@ class ReplayEngine:
             if self.frame_enables.is_enabled(frame.channel, frame.message_id)
         ]
 
-    def _handle_startup_sync(self, frames: Sequence[FrameEvent], now_ns: int) -> Optional[int]:
-        first_enabled_index = self._first_enabled_frame_index(frames)
-        if first_enabled_index is None:
-            return None
-        first_enabled_frame = frames[first_enabled_index]
-        binding = self._binding_for(first_enabled_frame.channel)
-        if binding is None:
-            raise ConfigurationError(f"逻辑通道 {first_enabled_frame.channel} 未绑定设备。")
-        adapter = self._adapters.get(binding.adapter_id)
-        if adapter is None:
-            raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
-        if not adapter.capabilities().sync_send:
-            self._startup_sync_pending = False
-            return None
-        target_ns = self._base_perf_ns + first_enabled_frame.ts_ns
-        if now_ns < target_ns:
-            self._sleep_until(target_ns)
-            return 0
-        prepared = self._prepare_enabled_frame(first_enabled_frame)
-        try:
-            sent = int(adapter.send_sync(prepared.frame, STARTUP_SYNC_TIMEOUT_MS) or 0)
-        except Exception as exc:
-            self._startup_sync_pending = False
-            self._startup_sync_force_immediate_batch = True
-            self._record_error(str(exc))
-            self._log_warning(f"回放首帧同步发送失败，已回退到常规批量发送：{exc}")
-            return None
+    def _handle_startup_sync(self) -> None:
+        targets = self._startup_sync_targets()
         self._startup_sync_pending = False
-        if sent <= 0:
-            self._startup_sync_force_immediate_batch = True
-            self._log_warning("回放首帧同步发送未完成，已回退到常规批量发送。")
-            return None
-        if first_enabled_index:
-            self._add_skipped_frames(first_enabled_index)
-        self._add_sent_frames(1)
-        self._base_perf_ns = time.perf_counter_ns() - first_enabled_frame.ts_ns
-        self._log_sent_frame(prepared)
-        self._log_debug(
-            f"回放首帧同步对齐：T={first_enabled_frame.ts_ns / 1_000_000:.3f} ms"
-        )
-        return first_enabled_index + 1
+        if not targets:
+            return
+        sent_count = 0
+        for target in targets:
+            adapter = self._adapters.get(target.adapter_id)
+            if adapter is None:
+                raise ConfigurationError(f"适配器 {target.adapter_id} 未配置。")
+            try:
+                sent = int(adapter.send_sync(target.frame, STARTUP_SYNC_TIMEOUT_MS) or 0)
+            except Exception as exc:
+                self._record_error(str(exc))
+                self._log_warning(
+                    "启动同步帧发送失败：适配器={adapter} 物理通道={channel} {detail}".format(
+                        adapter=target.adapter_id,
+                        channel=target.physical_channel,
+                        detail=exc,
+                    )
+                )
+                continue
+            if sent <= 0:
+                self._log_warning(
+                    f"启动同步帧发送未完成：适配器={target.adapter_id} 物理通道={target.physical_channel}"
+                )
+                continue
+            sent_count += 1
+            self._log_startup_sync_frame(target)
+        if sent_count:
+            self._base_perf_ns = time.perf_counter_ns()
+            self._log_debug(f"启动同步帧对齐：已发送 {sent_count} 个通道。")
 
     def _first_enabled_frame_index(self, frames: Sequence[FrameEvent]) -> Optional[int]:
         for index, frame in enumerate(frames):
             if self.frame_enables.is_enabled(frame.channel, frame.message_id):
                 return index
         return None
+
+    def _frame_dispatch_ts_ns(self, frames: Sequence[FrameEvent]) -> int:
+        if not frames:
+            return 0
+        first_enabled_index = self._first_enabled_frame_index(frames)
+        if first_enabled_index is None:
+            return frames[0].ts_ns
+        return frames[first_enabled_index].ts_ns
+
+    def _startup_sync_targets(self) -> List[PreparedFrame]:
+        assert self._scenario is not None
+        targets: List[PreparedFrame] = []
+        seen_endpoints: set[tuple[str, int]] = set()
+        adapter_supports_sync: Dict[str, bool] = {}
+        for binding in self._scenario.bindings:
+            if binding.bus_type not in STARTUP_SYNC_BUS_TYPES:
+                continue
+            supports_sync = adapter_supports_sync.get(binding.adapter_id)
+            if supports_sync is None:
+                adapter = self._adapters.get(binding.adapter_id)
+                if adapter is None:
+                    raise ConfigurationError(f"适配器 {binding.adapter_id} 未配置。")
+                supports_sync = adapter.capabilities().sync_send
+                adapter_supports_sync[binding.adapter_id] = supports_sync
+            if not supports_sync:
+                continue
+            endpoint = (binding.adapter_id, binding.physical_channel)
+            if endpoint in seen_endpoints:
+                continue
+            seen_endpoints.add(endpoint)
+            targets.append(self._build_startup_sync_target(binding))
+        return sorted(targets, key=lambda item: (item.adapter_id, item.physical_channel))
+
+    def _build_startup_sync_target(self, binding: DeviceChannelBinding) -> PreparedFrame:
+        return PreparedFrame(
+            adapter_id=binding.adapter_id,
+            logical_channel=binding.logical_channel,
+            physical_channel=binding.physical_channel,
+            frame=FrameEvent(
+                ts_ns=0,
+                bus_type=binding.bus_type,
+                channel=binding.physical_channel,
+                message_id=STARTUP_SYNC_MESSAGE_ID,
+                payload=STARTUP_SYNC_PAYLOAD,
+                dlc=STARTUP_SYNC_DLC,
+                metadata={"startup_sync": True},
+            ),
+        )
 
     def _prepare_enabled_frame(self, frame: FrameEvent) -> PreparedFrame:
         binding = self._binding_for(frame.channel)
@@ -706,6 +734,20 @@ class ReplayEngine:
         if not self._should_log_frame(item):
             return
         self._log_debug(self._format_sent_frame_log(item))
+
+    def _log_startup_sync_frame(self, item: PreparedFrame) -> None:
+        self._log_info(
+            "启动同步帧 [{bus}] 适配器={adapter} 逻辑通道={logical} 物理通道={physical} "
+            "ID=0x{id:X} DLC={dlc} DATA={data}".format(
+                bus=item.frame.bus_type.value,
+                adapter=item.adapter_id,
+                logical=item.logical_channel,
+                physical=item.physical_channel,
+                id=item.frame.message_id,
+                dlc=item.frame.dlc,
+                data=item.frame.payload.hex().upper(),
+            )
+        )
 
     def _should_log_frame(self, item: PreparedFrame) -> bool:
         if item.frame.bus_type not in FRAME_LOG_BUS_TYPES:
