@@ -9,6 +9,7 @@ from replay_platform.adapters.base import DiagnosticClient
 from replay_platform.adapters.mock import MockDeviceAdapter
 from replay_platform.core import (
     AdapterCapabilities,
+    AdapterHealth,
     BusType,
     DeviceChannelBinding,
     DiagnosticAction,
@@ -90,6 +91,16 @@ class PartialSendMockDeviceAdapter(RecordingMockDeviceAdapter):
         accepted = max(0, min(self._sent_count, len(batch)))
         self.sent_frames.extend(batch[:accepted])
         return accepted
+
+
+class HealthCountingMockDeviceAdapter(MockDeviceAdapter):
+    def __init__(self, adapter_id: str = "mock", channel_count: int = 4) -> None:
+        super().__init__(adapter_id, channel_count=channel_count)
+        self.health_calls = 0
+
+    def health(self) -> AdapterHealth:
+        self.health_calls += 1
+        return super().health()
 
 
 class CloseRecordingMockDeviceAdapter(MockDeviceAdapter):
@@ -351,6 +362,41 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual("done.asc", completed_snapshot.current_source_file)
         self.assertFalse(completed_snapshot.loop_enabled)
         self.assertEqual(0, completed_snapshot.completed_loops)
+
+    def test_runtime_snapshot_throttles_adapter_health_refresh_during_frame_progress(self):
+        adapter = HealthCountingMockDeviceAdapter("mock-1", channel_count=1)
+        scenario = ScenarioSpec(
+            scenario_id="s-snapshot-health-throttle",
+            name="Snapshot health throttle",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock-1",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+        )
+        frames = [
+            FrameEvent(ts_ns=0, bus_type=BusType.CAN, channel=0, message_id=0x100, payload=b"\x01", dlc=1),
+            FrameEvent(ts_ns=1_000_000, bus_type=BusType.CAN, channel=0, message_id=0x101, payload=b"\x02", dlc=1),
+            FrameEvent(ts_ns=2_000_000, bus_type=BusType.CAN, channel=0, message_id=0x102, payload=b"\x03", dlc=1),
+        ]
+        engine = ReplayEngine(signal_overrides=SignalOverrideService())
+        engine._adapter_health_refresh_interval_ns = 1_000_000_000
+        engine.configure(scenario, frames, {"mock-1": adapter}, {})
+        engine.start()
+
+        self._wait_for(
+            lambda: engine.state == ReplayState.STOPPED,
+            timeout_s=0.3,
+            failure_message="adapter health throttling 用例未在预期时间内结束。",
+        )
+        engine.finalize_completed_replay()
+
+        self.assertEqual(4, adapter.health_calls)
 
     def test_completed_replay_defers_adapter_close_until_finalization(self):
         adapter = CloseRecordingMockDeviceAdapter("mock-1", channel_count=1)

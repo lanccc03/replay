@@ -11,6 +11,7 @@ from replay_platform.ui.main_window import (
     _build_log_level_hint,
     _format_replay_stats,
     _binding_draft_from_item,
+    _build_frame_enable_candidate_ids_from_trace_summaries,
     _binding_summary,
     _frame_enable_rule_summary,
     _build_scenario_delete_summary,
@@ -388,6 +389,50 @@ class MainWindowHelperTests(unittest.TestCase):
         rule = FrameEnableRule(logical_channel=1, message_id=0x123, enabled=False)
 
         self.assertEqual("LC1 | 0x123 | 禁用", _frame_enable_rule_summary(rule))
+
+    def test_build_frame_enable_candidates_uses_source_channels_without_file_mapping(self) -> None:
+        candidates = _build_frame_enable_candidate_ids_from_trace_summaries(
+            ["trace-a"],
+            [],
+            {
+                "trace-a": [
+                    {"source_channel": 0, "bus_type": "CANFD", "message_ids": [0x100, 0x101]},
+                    {"source_channel": 1, "bus_type": "CAN", "message_ids": [0x200]},
+                ]
+            },
+        )
+
+        self.assertEqual({0: [0x100, 0x101], 1: [0x200]}, candidates)
+
+    def test_build_frame_enable_candidates_maps_trace_sources_to_logical_channels(self) -> None:
+        candidates = _build_frame_enable_candidate_ids_from_trace_summaries(
+            ["trace-a", "trace-b"],
+            [
+                {
+                    "trace_file_id": "trace-a",
+                    "source_channel": 0,
+                    "source_bus_type": "CANFD",
+                    "logical_channel": 7,
+                },
+                {
+                    "trace_file_id": "trace-b",
+                    "source_channel": 2,
+                    "source_bus_type": "CAN",
+                    "logical_channel": 3,
+                },
+            ],
+            {
+                "trace-a": [
+                    {"source_channel": 0, "bus_type": "CANFD", "message_ids": [0x100, 0x101]},
+                    {"source_channel": 1, "bus_type": "CANFD", "message_ids": [0x999]},
+                ],
+                "trace-b": [
+                    {"source_channel": 2, "bus_type": "CAN", "message_ids": [0x200, 0x201]},
+                ],
+            },
+        )
+
+        self.assertEqual({7: [0x100, 0x101], 3: [0x200, 0x201]}, candidates)
 
     def test_format_replay_stats_includes_loop_progress_when_enabled(self) -> None:
         stats = ReplayStats(sent_frames=12, skipped_frames=2, diagnostic_actions=1, link_actions=3)

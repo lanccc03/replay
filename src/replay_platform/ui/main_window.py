@@ -4,7 +4,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from replay_platform.app_controller import (
     DEBUG_LOG_FRAME_SAMPLE_RATE,
@@ -14,6 +14,7 @@ from replay_platform.app_controller import (
     LOG_LEVEL_PRESET_OPTIONS,
     LOG_LEVEL_PRESET_WARNING,
     ReplayApplication,
+    ReplayPreparation,
 )
 from replay_platform.core import (
     BusType,
@@ -559,6 +560,81 @@ def _build_trace_selection_summary(records: list[TraceFileRecord]) -> str:
     )
 
 
+def _normalize_trace_message_id_summary_item(raw_item: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw_item, dict):
+        return None
+    source_channel = _parse_optional_int_text(raw_item.get("source_channel"))
+    bus_type = _display_text(raw_item.get("bus_type", "")).strip().upper()
+    if source_channel is None or not bus_type:
+        return None
+    message_ids: list[int] = []
+    for raw_message_id in raw_item.get("message_ids", []):
+        parsed_message_id = _parse_optional_int_text(raw_message_id)
+        if parsed_message_id is None:
+            continue
+        message_ids.append(parsed_message_id)
+    return {
+        "source_channel": source_channel,
+        "bus_type": bus_type,
+        "message_ids": sorted(set(message_ids)),
+    }
+
+
+def _build_frame_enable_candidate_ids_from_trace_summaries(
+    trace_ids: Sequence[str],
+    bindings: Sequence[dict[str, Any]],
+    summary_lookup: dict[str, Sequence[dict[str, Any]]],
+) -> dict[int, list[int]]:
+    candidates: dict[int, set[int]] = {}
+    bindings_by_trace_id: dict[str, list[dict[str, Any]]] = {}
+    for binding in bindings:
+        trace_file_id = _display_text(binding.get("trace_file_id", "")).strip()
+        source_channel = _parse_optional_int_text(binding.get("source_channel"))
+        source_bus_type = _display_text(binding.get("source_bus_type", "")).strip().upper()
+        logical_channel = _parse_optional_int_text(binding.get("logical_channel"))
+        if not trace_file_id or source_channel is None or not source_bus_type or logical_channel is None:
+            continue
+        bindings_by_trace_id.setdefault(trace_file_id, []).append(
+            {
+                "logical_channel": logical_channel,
+                "source_channel": source_channel,
+                "source_bus_type": source_bus_type,
+            }
+        )
+
+    for trace_id in trace_ids:
+        normalized_summaries = [
+            normalized
+            for normalized in (
+                _normalize_trace_message_id_summary_item(raw_item)
+                for raw_item in summary_lookup.get(trace_id, [])
+            )
+            if normalized is not None
+        ]
+        mapped_bindings = bindings_by_trace_id.get(trace_id, [])
+        if mapped_bindings:
+            for binding in mapped_bindings:
+                matching_summary = next(
+                    (
+                        summary
+                        for summary in normalized_summaries
+                        if summary["source_channel"] == binding["source_channel"]
+                        and summary["bus_type"] == binding["source_bus_type"]
+                    ),
+                    None,
+                )
+                if matching_summary is None:
+                    continue
+                candidates.setdefault(binding["logical_channel"], set()).update(matching_summary["message_ids"])
+            continue
+        for summary in normalized_summaries:
+            candidates.setdefault(summary["source_channel"], set()).update(summary["message_ids"])
+    return {
+        logical_channel: sorted(message_ids)
+        for logical_channel, message_ids in candidates.items()
+    }
+
+
 def _build_scenario_selection_summary(record: Optional[ScenarioSpec]) -> str:
     if record is None:
         return "当前未选中场景。"
@@ -1091,7 +1167,7 @@ class MainWindowMixin:
 
 
 def build_main_window(app_logic: ReplayApplication):
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (
         QApplication,
@@ -1124,6 +1200,27 @@ def build_main_window(app_logic: ReplayApplication):
         QVBoxLayout,
         QWidget,
     )
+
+    class BackgroundTask(QObject):
+        succeeded = Signal(object)
+        failed = Signal(str)
+        finished = Signal()
+
+        def __init__(self, task: Callable[[], Any]) -> None:
+            super().__init__()
+            self._task = task
+
+        @Slot()
+        def run(self) -> None:
+            try:
+                result = self._task()
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                self.failed.emit(message)
+            else:
+                self.succeeded.emit(result)
+            finally:
+                self.finished.emit()
 
     class CollectionItemDialog(QDialog):
         def __init__(
@@ -1282,6 +1379,8 @@ def build_main_window(app_logic: ReplayApplication):
                 "link_actions": [],
             }
             self._collection_sections: dict[str, dict[str, Any]] = {}
+            self._trace_records_cache: dict[str, TraceFileRecord] = {}
+            self._trace_source_summary_cache: dict[str, list[dict[str, Any]]] = {}
             self._validation_timer = QTimer(self)
             self._validation_timer.setSingleShot(True)
             self._validation_timer.setInterval(150)
@@ -1938,6 +2037,7 @@ def build_main_window(app_logic: ReplayApplication):
             if prompt_on_unsaved and not self._confirm_close_with_unsaved_changes():
                 return False
 
+            self._refresh_trace_library_cache()
             self._suspend_updates = True
             self._validation_timer.stop()
             self._draft_bindings = [_binding_draft_from_item(item) for item in normalized.get("bindings", [])]
@@ -1975,11 +2075,20 @@ def build_main_window(app_logic: ReplayApplication):
             return True
 
         def refresh_trace_choices(self) -> None:
+            self._refresh_trace_library_cache()
             self._suspend_updates = True
             self._populate_trace_choices(set(self._checked_trace_ids()))
             self._suspend_updates = False
             self._handle_trace_selection_changed()
             self._run_live_validation()
+
+        def _refresh_trace_library_cache(self) -> None:
+            self._trace_records_cache = {record.trace_id: record for record in self.app_logic.list_traces()}
+            self._trace_source_summary_cache = {
+                trace_id: summaries
+                for trace_id, summaries in self._trace_source_summary_cache.items()
+                if trace_id in self._trace_records_cache
+            }
 
         def export_scenario(self, use_selected_trace_fallback: bool = False) -> ScenarioSpec:
             result = self._validate_current_draft()
@@ -2052,15 +2161,20 @@ def build_main_window(app_logic: ReplayApplication):
             self._refresh_all_collection_lists()
 
         def _binding_trace_lookup(self) -> dict[str, TraceFileRecord]:
-            return {record.trace_id: record for record in self.app_logic.list_traces()}
+            return dict(self._trace_records_cache)
 
         def _binding_trace_source_summaries(self, trace_id: str) -> list[dict]:
             if not trace_id:
                 return []
+            cached = self._trace_source_summary_cache.get(trace_id)
+            if cached is not None:
+                return [dict(item) for item in cached]
             try:
-                return self.app_logic.get_trace_source_summaries(trace_id)
+                summaries = [dict(item) for item in self.app_logic.get_trace_source_summaries(trace_id)]
             except Exception:
                 return []
+            self._trace_source_summary_cache[trace_id] = summaries
+            return [dict(item) for item in summaries]
 
         def _next_binding_logical_channel(self) -> int:
             existing_channels = {
@@ -2601,7 +2715,7 @@ def build_main_window(app_logic: ReplayApplication):
                 metadata = {}
 
             trace_ids = self._checked_trace_ids()
-            existing_trace_ids = {record.trace_id for record in self.app_logic.list_traces()}
+            existing_trace_ids = set(self._binding_trace_lookup())
             missing_trace_ids = [trace_id for trace_id in trace_ids if trace_id not in existing_trace_ids]
             if missing_trace_ids:
                 warnings.append(
@@ -3010,10 +3124,18 @@ def build_main_window(app_logic: ReplayApplication):
             self._override_catalog_channels: set[int] = set()
             self._frame_enable_candidate_ids: dict[int, list[int]] = {}
             self._frame_enable_candidate_trace_ids: tuple[str, ...] = ()
+            self._frame_enable_candidate_binding_signature: tuple[tuple[str, int, int, str], ...] = ()
             self._all_trace_records: list[TraceFileRecord] = []
             self._trace_lookup: dict[str, TraceFileRecord] = {}
             self._all_scenarios: list[ScenarioSpec] = []
             self._scenario_lookup: dict[str, ScenarioSpec] = {}
+            self._trace_import_in_progress = False
+            self._trace_import_thread: Optional[QThread] = None
+            self._trace_import_worker: Optional[BackgroundTask] = None
+            self._replay_prepare_in_progress = False
+            self._replay_prepare_thread: Optional[QThread] = None
+            self._replay_prepare_worker: Optional[BackgroundTask] = None
+            self._replay_prepare_message = ""
             self.setWindowTitle("多总线回放与诊断平台")
             self.resize(1480, 980)
             self._build_ui()
@@ -3120,7 +3242,7 @@ def build_main_window(app_logic: ReplayApplication):
             controls_buttons = QHBoxLayout()
             controls_buttons.setSpacing(10)
             self.start_button = QPushButton("开始回放")
-            self.start_button.clicked.connect(self._start_replay)
+            self.start_button.clicked.connect(self._begin_start_replay)
             self._set_button_variant(self.start_button, "primary")
             controls_buttons.addWidget(self.start_button)
 
@@ -3202,9 +3324,15 @@ def build_main_window(app_logic: ReplayApplication):
             self.trace_selection_summary.setProperty("role", "muted")
             layout.addWidget(self.trace_selection_summary)
 
+            self.trace_operation_label = QLabel()
+            self.trace_operation_label.setWordWrap(True)
+            self.trace_operation_label.setProperty("role", "muted")
+            self.trace_operation_label.hide()
+            layout.addWidget(self.trace_operation_label)
+
             buttons = QHBoxLayout()
             self.import_button = QPushButton("导入回放文件")
-            self.import_button.clicked.connect(self._import_trace)
+            self.import_button.clicked.connect(self._begin_trace_import)
             self._set_button_variant(self.import_button, "secondary")
             buttons.addWidget(self.import_button)
 
@@ -3677,6 +3805,93 @@ def build_main_window(app_logic: ReplayApplication):
             widget.style().polish(widget)
             widget.update()
 
+        def _set_trace_operation_message(self, message: str, *, tone: Optional[str] = None) -> None:
+            self.trace_operation_label.setText(message)
+            self.trace_operation_label.setProperty("tone", tone)
+            self._refresh_style(self.trace_operation_label)
+            self.trace_operation_label.setVisible(bool(message))
+
+        def _start_background_task(
+            self,
+            task: Callable[[], Any],
+            *,
+            on_success: Callable[[Any], None],
+            on_failure: Callable[[str], None],
+            on_cleanup: Callable[[], None],
+        ) -> tuple[QThread, BackgroundTask]:
+            thread = QThread(self)
+            worker = BackgroundTask(task)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.succeeded.connect(on_success)
+            worker.failed.connect(on_failure)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(on_cleanup)
+            thread.start()
+            return thread, worker
+
+        def _set_trace_import_busy(self, busy: bool, *, path: str = "") -> None:
+            self._trace_import_in_progress = busy
+            if busy:
+                filename = Path(path).name if path else ""
+                message = "正在导入回放文件，请稍候。"
+                if filename:
+                    message = f"正在导入：{filename}"
+                self._set_trace_operation_message(message)
+            self._refresh_busy_controls()
+
+        def _clear_trace_import_task(self) -> None:
+            self._trace_import_thread = None
+            self._trace_import_worker = None
+            self._set_trace_import_busy(False)
+
+        def _set_replay_prepare_busy(self, busy: bool, *, trace_count: int = 0) -> None:
+            self._replay_prepare_in_progress = busy
+            if busy:
+                message = "运行状态：正在准备回放，请稍候。"
+                if trace_count > 0:
+                    message = f"运行状态：正在准备 {trace_count} 个回放文件，请稍候。"
+                self._replay_prepare_message = message
+            else:
+                self._replay_prepare_message = ""
+            self._refresh_busy_controls()
+            self._refresh_runtime_state()
+
+        def _clear_replay_prepare_task(self) -> None:
+            self._replay_prepare_thread = None
+            self._replay_prepare_worker = None
+            self._set_replay_prepare_busy(False)
+
+        def _refresh_busy_controls(self) -> None:
+            replay_locked = self._replay_prepare_in_progress
+            self.trace_search_edit.setEnabled(not replay_locked)
+            self.trace_list.setEnabled(not replay_locked)
+            self.scenario_search_edit.setEnabled(not replay_locked)
+            self.scenario_list.setEnabled(not replay_locked)
+            self.override_channel.setEnabled(not replay_locked)
+            self.override_message.setEnabled(not replay_locked)
+            self.override_signal.setEnabled(not replay_locked)
+            self.override_value.setEnabled(not replay_locked)
+            self.override_apply.setEnabled(not replay_locked)
+            self.override_table.setEnabled(not replay_locked)
+            self.delete_override_button.setEnabled(not replay_locked and bool(self.override_table.selectedIndexes()))
+            self.clear_overrides_button.setEnabled(not replay_locked and self.override_table.rowCount() > 0)
+            self.frame_enable_channel.setEnabled(not replay_locked)
+            self.frame_enable_message.setEnabled(not replay_locked)
+            self.frame_enable_status.setEnabled(not replay_locked)
+            self.frame_enable_apply.setEnabled(not replay_locked and self._current_frame_enable_message_id() is not None)
+            self.frame_enable_table.setEnabled(not replay_locked)
+            self.delete_frame_enable_button.setEnabled(not replay_locked and bool(self.frame_enable_table.selectedIndexes()))
+            self.clear_frame_enable_button.setEnabled(not replay_locked and self.frame_enable_table.rowCount() > 0)
+            self.open_editor_button.setEnabled(not replay_locked)
+            self.edit_scenario_button.setEnabled(not replay_locked and self._selected_scenario_record() is not None)
+            if self._scenario_editor is not None:
+                self._scenario_editor.setEnabled(not replay_locked)
+            self._update_trace_actions()
+            self._update_scenario_actions()
+
         def _ensure_scenario_editor(self) -> ScenarioEditorDialog:
             if self._scenario_editor is None:
                 self._scenario_editor = ScenarioEditorDialog(
@@ -3705,6 +3920,14 @@ def build_main_window(app_logic: ReplayApplication):
             scenario_id = _display_text(self._current_scenario_payload.get("scenario_id", "")).strip()
             if scenario_id:
                 QApplication.clipboard().setText(scenario_id)
+
+        def _select_trace(self, trace_id: str) -> None:
+            for index in range(self.trace_list.count()):
+                item = self.trace_list.item(index)
+                if item.data(USER_ROLE) == trace_id:
+                    self.trace_list.setCurrentItem(item)
+                    item.setSelected(True)
+                    return
 
         def _select_scenario(self, scenario_id: str) -> None:
             for index in range(self.scenario_list.count()):
@@ -3750,10 +3973,17 @@ def build_main_window(app_logic: ReplayApplication):
             return self._scenario_lookup.get(selected[0].data(USER_ROLE))
 
         def _update_trace_actions(self) -> None:
-            self.delete_trace_button.setEnabled(self._selected_trace_record() is not None)
+            busy = self._trace_import_in_progress or self._replay_prepare_in_progress
+            self.import_button.setEnabled(not busy)
+            self.refresh_button.setEnabled(not busy)
+            self.delete_trace_button.setEnabled(not busy and self._selected_trace_record() is not None)
 
         def _update_scenario_actions(self) -> None:
-            self.delete_scenario_button.setEnabled(self._selected_scenario_record() is not None)
+            busy = self._replay_prepare_in_progress
+            has_selection = self._selected_scenario_record() is not None
+            self.new_scenario_button.setEnabled(not busy)
+            self.edit_scenario_button.setEnabled(not busy and has_selection)
+            self.delete_scenario_button.setEnabled(not busy and has_selection)
 
         def _sync_override_catalogs(self) -> None:
             loaded_channels: set[int] = set()
@@ -3786,24 +4016,47 @@ def build_main_window(app_logic: ReplayApplication):
                 ]
             return tuple(sorted(set(trace_ids)))
 
+        def _trace_message_id_summaries(self, trace_id: str) -> list[dict]:
+            if not trace_id:
+                return []
+            try:
+                return self.app_logic.get_trace_message_id_summaries(trace_id)
+            except Exception:
+                return []
+
+        def _frame_enable_binding_signature(self) -> tuple[tuple[str, int, int, str], ...]:
+            signature: list[tuple[str, int, int, str]] = []
+            for binding in self._current_scenario_payload.get("bindings", []):
+                trace_file_id = _display_text(binding.get("trace_file_id", "")).strip()
+                source_channel = _parse_optional_int_text(binding.get("source_channel"))
+                logical_channel = _parse_optional_int_text(binding.get("logical_channel"))
+                source_bus_type = _display_text(binding.get("source_bus_type", "")).strip().upper()
+                if not trace_file_id or source_channel is None or logical_channel is None or not source_bus_type:
+                    continue
+                signature.append((trace_file_id, logical_channel, source_channel, source_bus_type))
+            return tuple(sorted(signature))
+
         def _refresh_frame_enable_candidates(self, *, force: bool = False) -> None:
             trace_ids = self._effective_frame_enable_trace_ids()
-            if not force and trace_ids == self._frame_enable_candidate_trace_ids:
+            binding_signature = self._frame_enable_binding_signature()
+            if (
+                not force
+                and trace_ids == self._frame_enable_candidate_trace_ids
+                and binding_signature == self._frame_enable_candidate_binding_signature
+            ):
                 self._refresh_frame_enable_message_options()
                 return
-            candidates: dict[int, set[int]] = {}
-            for trace_id in trace_ids:
-                try:
-                    events = self.app_logic.library.load_trace_events(trace_id)
-                except Exception:
-                    continue
-                for event in events:
-                    candidates.setdefault(event.channel, set()).add(event.message_id)
-            self._frame_enable_candidate_ids = {
-                logical_channel: sorted(message_ids)
-                for logical_channel, message_ids in candidates.items()
+            summary_lookup = {
+                trace_id: self._trace_message_id_summaries(trace_id)
+                for trace_id in trace_ids
             }
+            self._frame_enable_candidate_ids = _build_frame_enable_candidate_ids_from_trace_summaries(
+                trace_ids,
+                self._current_scenario_payload.get("bindings", []),
+                summary_lookup,
+            )
             self._frame_enable_candidate_trace_ids = trace_ids
+            self._frame_enable_candidate_binding_signature = binding_signature
             self._refresh_frame_enable_message_options()
 
         def _refresh_current_scenario_summary(self) -> None:
@@ -3835,6 +4088,20 @@ def build_main_window(app_logic: ReplayApplication):
         def _refresh_runtime_state(self) -> None:
             assessment = self._current_launch_assessment()
             snapshot = self.app_logic.runtime_snapshot()
+            if self._replay_prepare_in_progress:
+                self.start_button.setEnabled(False)
+                self.pause_button.setEnabled(False)
+                self.resume_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.loop_playback_checkbox.setEnabled(False)
+                self._set_badge(self.runtime_badge, "准备中", "info")
+                self.status_label.setText(self._replay_prepare_message or "运行状态：正在准备回放，请稍候。")
+                self.stats_label.setText(_format_replay_stats(self.app_logic.engine.stats, snapshot))
+                self.runtime_progress_label.setText("进度：正在准备回放数据，请稍候。")
+                self.runtime_source_label.setText(assessment.source_text)
+                self.runtime_device_label.setText(assessment.detail_text)
+                self.runtime_launch_label.setText("启动动作：准备完成后会自动开始回放。")
+                return
             buttons = _playback_button_state(snapshot.state, assessment.ready)
             self.start_button.setEnabled(buttons.start_enabled)
             self.pause_button.setEnabled(buttons.pause_enabled)
@@ -4051,6 +4318,11 @@ def build_main_window(app_logic: ReplayApplication):
                 return None
 
         def _update_override_actions(self) -> None:
+            if self._replay_prepare_in_progress:
+                self.delete_override_button.setEnabled(False)
+                self.clear_overrides_button.setEnabled(False)
+                self.override_apply.setEnabled(False)
+                return
             has_selection = bool(self.override_table.selectedIndexes())
             has_rows = self.override_table.rowCount() > 0
             message_id = self._current_override_message_id()
@@ -4061,6 +4333,11 @@ def build_main_window(app_logic: ReplayApplication):
             self.override_apply.setEnabled(message_id is not None and bool(signal_name) and bool(value_text))
 
         def _update_frame_enable_actions(self) -> None:
+            if self._replay_prepare_in_progress:
+                self.delete_frame_enable_button.setEnabled(False)
+                self.clear_frame_enable_button.setEnabled(False)
+                self.frame_enable_apply.setEnabled(False)
+                return
             has_selection = bool(self.frame_enable_table.selectedIndexes())
             has_rows = self.frame_enable_table.rowCount() > 0
             message_id = self._current_frame_enable_message_id()
@@ -4068,7 +4345,21 @@ def build_main_window(app_logic: ReplayApplication):
             self.clear_frame_enable_button.setEnabled(has_rows)
             self.frame_enable_apply.setEnabled(message_id is not None)
 
-        def _import_trace(self) -> None:
+        def _handle_trace_import_succeeded(self, result: Any) -> None:
+            self._refresh_traces()
+            if isinstance(result, TraceFileRecord):
+                self._select_trace(result.trace_id)
+                self._set_trace_operation_message(f"导入完成：{result.name}", tone="good")
+                return
+            self._set_trace_operation_message("导入完成。", tone="good")
+
+        def _handle_trace_import_failed(self, message: str) -> None:
+            self._set_trace_operation_message("导入失败，请检查文件后重试。", tone="error")
+            QMessageBox.critical(self, "导入失败", message)
+
+        def _begin_trace_import(self) -> None:
+            if self._trace_import_in_progress or self._replay_prepare_in_progress:
+                return
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 "导入回放文件",
@@ -4077,12 +4368,16 @@ def build_main_window(app_logic: ReplayApplication):
             )
             if not path:
                 return
-            try:
-                self.app_logic.import_trace(path)
-            except Exception as exc:
-                QMessageBox.critical(self, "导入失败", str(exc))
-                return
-            self._refresh_traces()
+            self._set_trace_import_busy(True, path=path)
+            self._trace_import_thread, self._trace_import_worker = self._start_background_task(
+                lambda: self.app_logic.import_trace(path),
+                on_success=self._handle_trace_import_succeeded,
+                on_failure=self._handle_trace_import_failed,
+                on_cleanup=self._clear_trace_import_task,
+            )
+
+        def _import_trace(self) -> None:
+            self._begin_trace_import()
 
         def _delete_selected_trace(self) -> None:
             record = self._selected_trace_record()
@@ -4191,20 +4486,46 @@ def build_main_window(app_logic: ReplayApplication):
             self._set_current_scenario_payload(scenario.to_dict())
             return scenario, launch_source
 
-        def _start_replay(self) -> None:
+        def _handle_replay_prepare_succeeded(self, result: Any) -> None:
             try:
-                scenario, launch_source = self._scenario_from_current_source(use_selected_trace_fallback=True)
-                self.app_logic.start_replay(
-                    scenario,
-                    launch_source=launch_source,
-                    loop_enabled=self.loop_playback_checkbox.isChecked(),
-                )
+                if not isinstance(result, ReplayPreparation):
+                    raise TypeError("回放准备结果无效。")
+                self.app_logic.start_prepared_replay(result)
             except Exception as exc:
                 QMessageBox.critical(self, "回放失败", str(exc))
+                self._refresh_runtime_state()
                 return
             self._refresh_overrides()
             self._refresh_frame_enables()
             self._refresh_runtime_state()
+            self._refresh_logs()
+
+        def _handle_replay_prepare_failed(self, message: str) -> None:
+            QMessageBox.critical(self, "回放失败", message)
+
+        def _begin_start_replay(self) -> None:
+            if self._replay_prepare_in_progress:
+                return
+            try:
+                scenario, launch_source = self._scenario_from_current_source(use_selected_trace_fallback=True)
+                loop_enabled = self.loop_playback_checkbox.isChecked()
+            except Exception as exc:
+                QMessageBox.critical(self, "回放失败", str(exc))
+                return
+            self._set_replay_prepare_busy(True, trace_count=len(scenario.trace_file_ids))
+            self._replay_prepare_thread, self._replay_prepare_worker = self._start_background_task(
+                lambda: self.app_logic.prepare_replay(
+                    scenario,
+                    launch_source=launch_source,
+                    loop_enabled=loop_enabled,
+                ),
+                on_success=self._handle_replay_prepare_succeeded,
+                on_failure=self._handle_replay_prepare_failed,
+                on_cleanup=self._clear_replay_prepare_task,
+            )
+
+        def _start_replay(self) -> None:
+            self._begin_start_replay()
 
         def _pause_replay(self) -> None:
             self.app_logic.pause_replay()

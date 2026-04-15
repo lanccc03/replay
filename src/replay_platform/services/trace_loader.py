@@ -4,7 +4,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from replay_platform.core import BusType, FrameEvent, canfd_payload_length_to_dlc
 from replay_platform.errors import DependencyUnavailableError, TraceFormatError
@@ -47,6 +47,32 @@ def build_trace_source_summaries(events: Sequence[FrameEvent]) -> list[dict[str,
             "label": f"CH{source_channel} | {bus_type.value} | {frame_count}\u5e27",
         }
         for (source_channel, bus_type), frame_count in sorted(counts.items(), key=lambda item: (item[0][0], item[0][1].value))
+    ]
+
+
+def build_trace_message_id_summaries(events: Sequence[FrameEvent]) -> list[dict[str, Any]]:
+    grouped: Dict[tuple[int, BusType], dict[str, Any]] = {}
+    for event in events:
+        key = (int(event.channel), event.bus_type)
+        summary = grouped.setdefault(
+            key,
+            {
+                "source_channel": int(event.channel),
+                "bus_type": event.bus_type.value,
+                "frame_count": 0,
+                "message_ids": set(),
+            },
+        )
+        summary["frame_count"] += 1
+        summary["message_ids"].add(int(event.message_id))
+    return [
+        {
+            "source_channel": int(summary["source_channel"]),
+            "bus_type": str(summary["bus_type"]),
+            "frame_count": int(summary["frame_count"]),
+            "message_ids": sorted(int(message_id) for message_id in summary["message_ids"]),
+        }
+        for _key, summary in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1].value))
     ]
 
 
@@ -147,87 +173,110 @@ class TraceLoader:
                 handle.write(source)
                 handle.write(metadata)
 
-    def load_binary_cache(self, path: Path) -> List[FrameEvent]:
-        events: List[FrameEvent] = []
-        payload = path.read_bytes()
-        if len(payload) < _BINARY_FILE_HEADER.size:
-            raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
-        magic, version, record_count = _BINARY_FILE_HEADER.unpack(
-            payload[: _BINARY_FILE_HEADER.size]
-        )
-        if magic != BINARY_CACHE_MAGIC or version != BINARY_CACHE_VERSION:
-            raise TraceFormatError(f"不支持的二进制缓存格式：{path}")
-        offset = _BINARY_FILE_HEADER.size
-        view = memoryview(payload)
-        for _index in range(record_count):
-            if offset + _BINARY_RECORD_LENGTH.size > len(payload):
+    def load_binary_cache(
+        self,
+        path: Path,
+        *,
+        source_filters: Optional[set[tuple[int, BusType]]] = None,
+    ) -> List[FrameEvent]:
+        return list(self.iter_binary_cache(path, source_filters=source_filters))
+
+    def iter_binary_cache(
+        self,
+        path: str | Path,
+        *,
+        source_filters: Optional[set[tuple[int, BusType]]] = None,
+    ) -> Iterator[FrameEvent]:
+        cache_path = Path(path)
+        with cache_path.open("rb") as handle:
+            header = handle.read(_BINARY_FILE_HEADER.size)
+            if len(header) < _BINARY_FILE_HEADER.size:
                 raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
-            record_length = _BINARY_RECORD_LENGTH.unpack_from(payload, offset)[0]
-            offset += _BINARY_RECORD_LENGTH.size
-            record_end = offset + record_length
-            if record_end > len(payload):
-                raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
-            record = view[offset:record_end]
-            (
-                ts_ns,
-                bus_type_code,
-                channel,
-                message_id,
-                dlc,
-                payload_len,
-                flags_len,
-                source_len,
-                metadata_len,
-            ) = _BINARY_RECORD_HEADER.unpack_from(record, 0)
-            data_offset = _BINARY_RECORD_HEADER.size
-            frame_payload = bytes(record[data_offset : data_offset + payload_len])
-            data_offset += payload_len
-            flags_payload = bytes(record[data_offset : data_offset + flags_len])
-            data_offset += flags_len
-            source_payload = bytes(record[data_offset : data_offset + source_len])
-            data_offset += source_len
-            metadata_payload = bytes(record[data_offset : data_offset + metadata_len])
-            bus_type = _BUS_TYPE_FROM_CODE.get(bus_type_code)
-            if bus_type is None:
-                raise TraceFormatError(f"未知的总线类型编码：{bus_type_code}")
-            events.append(
-                FrameEvent(
+            magic, version, record_count = _BINARY_FILE_HEADER.unpack(header)
+            if magic != BINARY_CACHE_MAGIC or version != BINARY_CACHE_VERSION:
+                raise TraceFormatError(f"不支持的二进制缓存格式：{cache_path}")
+            for _index in range(record_count):
+                length_payload = handle.read(_BINARY_RECORD_LENGTH.size)
+                if len(length_payload) < _BINARY_RECORD_LENGTH.size:
+                    raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
+                record_length = _BINARY_RECORD_LENGTH.unpack(length_payload)[0]
+                record = handle.read(record_length)
+                if len(record) < record_length:
+                    raise TraceFormatError("二进制缓存文件已损坏或内容不完整。")
+                (
+                    ts_ns,
+                    bus_type_code,
+                    channel,
+                    message_id,
+                    dlc,
+                    payload_len,
+                    flags_len,
+                    source_len,
+                    metadata_len,
+                ) = _BINARY_RECORD_HEADER.unpack_from(record, 0)
+                bus_type = _BUS_TYPE_FROM_CODE.get(bus_type_code)
+                if bus_type is None:
+                    raise TraceFormatError(f"未知的总线类型编码：{bus_type_code}")
+                if source_filters is not None and (int(channel), bus_type) not in source_filters:
+                    continue
+                data_offset = _BINARY_RECORD_HEADER.size
+                frame_payload = record[data_offset : data_offset + payload_len]
+                data_offset += payload_len
+                flags_payload = record[data_offset : data_offset + flags_len]
+                data_offset += flags_len
+                source_payload = record[data_offset : data_offset + source_len]
+                data_offset += source_len
+                metadata_payload = record[data_offset : data_offset + metadata_len]
+                yield FrameEvent(
                     ts_ns=int(ts_ns),
                     bus_type=bus_type,
                     channel=int(channel),
                     message_id=int(message_id),
-                    payload=frame_payload,
+                    payload=bytes(frame_payload),
                     dlc=int(dlc),
                     flags=json.loads(flags_payload.decode("utf-8")) if flags_len else {},
                     source_file=source_payload.decode("utf-8"),
                     metadata=json.loads(metadata_payload.decode("utf-8")) if metadata_len else {},
                 )
-            )
-            offset = record_end
-        return events
+
+    def iter_asc(self, path: str | Path) -> Iterator[FrameEvent]:
+        trace_path = Path(path)
+        with trace_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if self._should_skip_asc_line(line):
+                    continue
+                event = self._parse_asc_event(line, trace_path)
+                if event is None:
+                    continue
+                yield event
 
     def _load_asc(self, path: Path) -> List[FrameEvent]:
         events: List[FrameEvent] = []
-        for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw_line.strip()
-            lower = line.lower()
-            if (
-                not line
-                or line.startswith("//")
-                or lower.startswith("date ")
-                or lower.startswith("base ")
-                or lower.endswith("internal events logged")
-                or lower.startswith("begin triggerblock")
-                or lower.startswith("end triggerblock")
-            ):
-                continue
-            event = self._parse_asc_event(line, path)
-            if event is None:
-                continue
+        previous_ts_ns: Optional[int] = None
+        needs_sort = False
+        for event in self.iter_asc(path):
+            if previous_ts_ns is not None and event.ts_ns < previous_ts_ns:
+                needs_sort = True
             events.append(event)
+            previous_ts_ns = event.ts_ns
         if not events:
             raise TraceFormatError(f"在 {path} 中未找到可识别的 ASC 帧。")
-        return sorted(events, key=lambda item: item.ts_ns)
+        if needs_sort:
+            events.sort(key=lambda item: item.ts_ns)
+        return events
+
+    def _should_skip_asc_line(self, line: str) -> bool:
+        lower = line.lower()
+        return (
+            not line
+            or line.startswith("//")
+            or lower.startswith("date ")
+            or lower.startswith("base ")
+            or lower.endswith("internal events logged")
+            or lower.startswith("begin triggerblock")
+            or lower.startswith("end triggerblock")
+        )
 
     def _parse_asc_event(self, line: str, path: Path) -> Optional[FrameEvent]:
         tokens = line.split()

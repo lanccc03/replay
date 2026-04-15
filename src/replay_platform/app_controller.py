@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import heapq
 import threading
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from replay_platform.adapters.base import DiagnosticClient, DeviceAdapter
 from replay_platform.adapters.mock import MockDeviceAdapter
@@ -11,6 +14,7 @@ from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.adapters.zlg import ZlgDeviceAdapter
 from replay_platform.core import (
     AdapterCapabilities,
+    BusType,
     ChannelDescriptor,
     DeviceChannelBinding,
     DiagnosticTransport,
@@ -22,6 +26,7 @@ from replay_platform.core import (
     ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
+    TraceFileRecord,
 )
 from replay_platform.services.frame_enable import FrameEnableService
 from replay_platform.diagnostics.can_uds import CanUdsClient, IsoTpConfig
@@ -45,6 +50,7 @@ LOG_LEVEL_PRESET_OPTIONS = (
     LOG_LEVEL_PRESET_DEBUG_SAMPLED,
     LOG_LEVEL_PRESET_DEBUG_ALL,
 )
+PREPARED_TRACE_CACHE_LIMIT = 6
 LOG_LEVEL_PRESET_CONFIGS = {
     LOG_LEVEL_PRESET_WARNING: (ReplayLogLevel.WARNING, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
     LOG_LEVEL_PRESET_INFO: (ReplayLogLevel.INFO, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
@@ -55,6 +61,22 @@ LOG_LEVEL_PRESET_CONFIGS = {
     ),
     LOG_LEVEL_PRESET_DEBUG_ALL: (ReplayLogLevel.DEBUG, ReplayFrameLogMode.ALL, DEBUG_LOG_FRAME_SAMPLE_RATE),
 }
+
+
+@dataclass(frozen=True)
+class ReplayPreparation:
+    scenario: ScenarioSpec
+    frames: List[FrameEvent]
+    launch_source: ReplayLaunchSource
+    loop_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedTraceCacheKey:
+    trace_id: str
+    source_label: str
+    source_filters: tuple[tuple[int, str], ...]
+    mapped_bindings: tuple[tuple[int, int, str], ...]
 
 
 class ReplayApplication:
@@ -75,6 +97,8 @@ class ReplayApplication:
         self._log_base_index = 0
         self._log_lock = threading.Lock()
         self._last_runtime_state = ReplayState.STOPPED
+        self._prepared_trace_cache: OrderedDict[PreparedTraceCacheKey, tuple[FrameEvent, ...]] = OrderedDict()
+        self._prepared_trace_cache_lock = threading.Lock()
 
     def log(self, message: str) -> None:
         self._append_log(message)
@@ -170,6 +194,9 @@ class ReplayApplication:
     def get_trace_source_summaries(self, trace_id: str) -> list[dict]:
         return self.library.get_trace_source_summaries(trace_id)
 
+    def get_trace_message_id_summaries(self, trace_id: str) -> list[dict]:
+        return self.library.get_trace_message_id_summaries(trace_id)
+
     def find_scenarios_referencing_trace(self, trace_id: str):
         return self.library.find_scenarios_referencing_trace(trace_id)
 
@@ -180,7 +207,9 @@ class ReplayApplication:
         self.library.save_scenario(scenario)
 
     def delete_trace(self, trace_id: str) -> DeleteTraceResult:
-        return self.library.delete_trace(trace_id)
+        result = self.library.delete_trace(trace_id)
+        self._invalidate_prepared_trace_cache(trace_id)
+        return result
 
     def delete_scenario(self, scenario_id: str) -> None:
         self.library.delete_scenario(scenario_id)
@@ -202,8 +231,31 @@ class ReplayApplication:
         launch_source: ReplayLaunchSource = ReplayLaunchSource.SCENARIO_BOUND,
         loop_enabled: bool = False,
     ) -> None:
-        self.frame_enables.clear_all()
+        preparation = self.prepare_replay(
+            scenario,
+            launch_source=launch_source,
+            loop_enabled=loop_enabled,
+        )
+        self.start_prepared_replay(preparation)
+
+    def prepare_replay(
+        self,
+        scenario: ScenarioSpec,
+        *,
+        launch_source: ReplayLaunchSource = ReplayLaunchSource.SCENARIO_BOUND,
+        loop_enabled: bool = False,
+    ) -> ReplayPreparation:
         frames = self._load_replay_frames(scenario)
+        return ReplayPreparation(
+            scenario=scenario,
+            frames=frames,
+            launch_source=launch_source,
+            loop_enabled=bool(loop_enabled),
+        )
+
+    def start_prepared_replay(self, preparation: ReplayPreparation) -> None:
+        scenario = preparation.scenario
+        self.frame_enables.clear_all()
         for binding in scenario.database_bindings:
             self.signal_overrides.load_database(binding.logical_channel, binding.path)
         for override in scenario.signal_overrides:
@@ -212,11 +264,11 @@ class ReplayApplication:
         diagnostics = self._build_diagnostics(scenario, adapters)
         self.engine.configure(
             scenario,
-            frames,
+            preparation.frames,
             adapters,
             diagnostics,
-            launch_source=launch_source,
-            loop_enabled=loop_enabled,
+            launch_source=preparation.launch_source,
+            loop_enabled=preparation.loop_enabled,
         )
         self.engine.start()
         self._last_runtime_state = self.engine.state
@@ -260,7 +312,7 @@ class ReplayApplication:
                     pass
 
     def _load_replay_frames(self, scenario: ScenarioSpec) -> List[FrameEvent]:
-        frames: List[FrameEvent] = []
+        trace_sequences: List[Sequence[FrameEvent]] = []
         trace_bound_bindings: Dict[str, List[DeviceChannelBinding]] = {}
         for binding in scenario.bindings:
             if not binding.trace_file_id:
@@ -274,17 +326,124 @@ class ReplayApplication:
 
         for trace_id in scenario.trace_file_ids:
             record = self.library.get_trace_file(trace_id)
-            trace_events = self.library.load_trace_events(trace_id)
-            if record is not None:
-                trace_events = [event.clone(source_file=record.original_path or record.name) for event in trace_events]
-            mapped_bindings = trace_bound_bindings.get(trace_id, [])
-            if mapped_bindings:
-                for binding in mapped_bindings:
-                    frames.extend(self._map_trace_events_for_binding(trace_events, binding))
-                continue
-            frames.extend(trace_events)
-        frames.sort(key=lambda item: item.ts_ns)
-        return frames
+            if record is None:
+                raise FileNotFoundError(trace_id)
+            trace_sequences.append(
+                self._prepared_trace_sequence(
+                    record,
+                    trace_bound_bindings.get(trace_id, []),
+                )
+            )
+        return self._merge_sorted_frame_groups(trace_sequences)
+
+    def _prepared_trace_sequence(
+        self,
+        record: TraceFileRecord,
+        mapped_bindings: Sequence[DeviceChannelBinding],
+    ) -> Sequence[FrameEvent]:
+        cache_key = self._prepared_trace_cache_key(record, mapped_bindings)
+        cached = self._get_prepared_trace_cache(cache_key)
+        if cached is not None:
+            return cached
+        source_filters = self._source_filters_for_bindings(mapped_bindings)
+        trace_events = self.library.load_trace_events(record.trace_id, source_filters=source_filters)
+        source_label = record.original_path or record.name
+        if source_label:
+            trace_events = [event.clone(source_file=source_label) for event in trace_events]
+        if mapped_bindings:
+            events_by_source: Dict[tuple[int, BusType], List[FrameEvent]] = {}
+            for event in trace_events:
+                events_by_source.setdefault((event.channel, event.bus_type), []).append(event)
+            mapped_sequences = [
+                self._map_trace_events_for_binding(
+                    events_by_source.get((int(binding.source_channel), binding.source_bus_type), []),
+                    binding,
+                )
+                for binding in mapped_bindings
+            ]
+            prepared_sequence = tuple(self._merge_sorted_frame_groups(mapped_sequences))
+        else:
+            prepared_sequence = tuple(trace_events)
+        self._store_prepared_trace_cache(cache_key, prepared_sequence)
+        return prepared_sequence
+
+    @staticmethod
+    def _source_filters_for_bindings(
+        mapped_bindings: Sequence[DeviceChannelBinding],
+    ) -> set[tuple[int, BusType]] | None:
+        if not mapped_bindings:
+            return None
+        return {
+            (int(binding.source_channel), binding.source_bus_type)
+            for binding in mapped_bindings
+            if binding.source_channel is not None and binding.source_bus_type is not None
+        } or None
+
+    @staticmethod
+    def _prepared_trace_cache_key(
+        record: TraceFileRecord,
+        mapped_bindings: Sequence[DeviceChannelBinding],
+    ) -> PreparedTraceCacheKey:
+        source_label = record.original_path or record.name
+        source_filters = tuple(
+            sorted(
+                (int(binding.source_channel), binding.source_bus_type.value)
+                for binding in mapped_bindings
+                if binding.source_channel is not None and binding.source_bus_type is not None
+            )
+        )
+        mapping_signature = tuple(
+            (
+                binding.logical_channel,
+                int(binding.source_channel),
+                binding.source_bus_type.value,
+            )
+            for binding in mapped_bindings
+            if binding.source_channel is not None and binding.source_bus_type is not None
+        )
+        return PreparedTraceCacheKey(
+            trace_id=record.trace_id,
+            source_label=source_label,
+            source_filters=source_filters,
+            mapped_bindings=mapping_signature,
+        )
+
+    def _get_prepared_trace_cache(
+        self,
+        cache_key: PreparedTraceCacheKey,
+    ) -> tuple[FrameEvent, ...] | None:
+        with self._prepared_trace_cache_lock:
+            cached = self._prepared_trace_cache.get(cache_key)
+            if cached is None:
+                return None
+            self._prepared_trace_cache.move_to_end(cache_key)
+            return cached
+
+    def _store_prepared_trace_cache(
+        self,
+        cache_key: PreparedTraceCacheKey,
+        frames: tuple[FrameEvent, ...],
+    ) -> None:
+        with self._prepared_trace_cache_lock:
+            self._prepared_trace_cache[cache_key] = frames
+            self._prepared_trace_cache.move_to_end(cache_key)
+            while len(self._prepared_trace_cache) > PREPARED_TRACE_CACHE_LIMIT:
+                self._prepared_trace_cache.popitem(last=False)
+
+    def _invalidate_prepared_trace_cache(self, trace_id: str) -> None:
+        with self._prepared_trace_cache_lock:
+            stale_keys = [key for key in self._prepared_trace_cache if key.trace_id == trace_id]
+            for cache_key in stale_keys:
+                self._prepared_trace_cache.pop(cache_key, None)
+
+    @staticmethod
+    def _merge_sorted_frame_groups(frame_groups: Sequence[Sequence[FrameEvent]]) -> List[FrameEvent]:
+        non_empty_groups = [group for group in frame_groups if group]
+        if not non_empty_groups:
+            return []
+        if len(non_empty_groups) == 1:
+            return list(non_empty_groups[0])
+        return list(heapq.merge(*non_empty_groups, key=lambda item: item.ts_ns))
 
     @staticmethod
     def _map_trace_events_for_binding(

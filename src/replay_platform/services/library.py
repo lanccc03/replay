@@ -8,14 +8,15 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
-from replay_platform.core import ScenarioSpec, TraceFileRecord
+from replay_platform.core import BusType, ScenarioSpec, TraceFileRecord
 from replay_platform.paths import AppPaths
 from replay_platform.services.trace_loader import (
     BINARY_CACHE_FORMAT,
     BINARY_CACHE_SUFFIX,
     TraceLoader,
+    build_trace_message_id_summaries,
     build_trace_source_summaries,
 )
 
@@ -103,6 +104,7 @@ class FileLibraryService:
                 "cache_path": str(cache_path),
                 "cache_format": BINARY_CACHE_FORMAT,
                 "source_summaries": build_trace_source_summaries(events),
+                "message_id_summaries": build_trace_message_id_summaries(events),
             },
         )
         with self._connect() as connection:
@@ -192,25 +194,32 @@ class FileLibraryService:
                 scenarios.append(scenario)
         return scenarios
 
-    def load_trace_events(self, trace_id: str):
+    def load_trace_events(
+        self,
+        trace_id: str,
+        *,
+        source_filters: Optional[set[tuple[int, BusType]]] = None,
+    ):
         record = self.get_trace_file(trace_id)
         if record is None:
             raise FileNotFoundError(trace_id)
+        normalized_filters = self._normalize_source_filters(source_filters)
         cache_path = Path(record.metadata.get("cache_path", ""))
         cache_format = str(record.metadata.get("cache_format", ""))
         if cache_path.exists():
             if cache_format == BINARY_CACHE_FORMAT or cache_path.suffix == BINARY_CACHE_SUFFIX:
-                events = self.trace_loader.load_binary_cache(cache_path)
-                self._ensure_trace_source_summaries(trace_id, record.metadata, events)
+                events = self.trace_loader.load_binary_cache(cache_path, source_filters=normalized_filters)
+                if normalized_filters is None:
+                    self._ensure_trace_summary_metadata(trace_id, record.metadata, events)
                 return events
             events = self.trace_loader.load_cache(cache_path)
             self._write_binary_cache(trace_id, record.metadata, events)
-            self._ensure_trace_source_summaries(trace_id, record.metadata, events)
-            return events
+            self._ensure_trace_summary_metadata(trace_id, record.metadata, events)
+            return self._filter_trace_events_by_source(events, normalized_filters)
         events = self.trace_loader.load(record.library_path)
         self._write_binary_cache(trace_id, record.metadata, events)
-        self._ensure_trace_source_summaries(trace_id, record.metadata, events)
-        return events
+        self._ensure_trace_summary_metadata(trace_id, record.metadata, events)
+        return self._filter_trace_events_by_source(events, normalized_filters)
 
     def get_trace_source_summaries(self, trace_id: str) -> list[dict]:
         record = self.get_trace_file(trace_id)
@@ -226,11 +235,54 @@ class FileLibraryService:
             if refreshed_existing:
                 return refreshed_existing
         summaries = build_trace_source_summaries(events)
-        self._ensure_trace_source_summaries(trace_id, record.metadata, events)
+        self._ensure_trace_summary_metadata(trace_id, record.metadata, events)
+        return summaries
+
+    def get_trace_message_id_summaries(self, trace_id: str) -> list[dict]:
+        record = self.get_trace_file(trace_id)
+        if record is None:
+            raise FileNotFoundError(trace_id)
+        existing = self._normalize_trace_message_id_summaries(record.metadata.get("message_id_summaries", []))
+        if existing:
+            return existing
+        events = self.load_trace_events(trace_id)
+        refreshed = self.get_trace_file(trace_id)
+        if refreshed is not None:
+            refreshed_existing = self._normalize_trace_message_id_summaries(
+                refreshed.metadata.get("message_id_summaries", [])
+            )
+            if refreshed_existing:
+                return refreshed_existing
+        summaries = build_trace_message_id_summaries(events)
+        self._ensure_trace_summary_metadata(trace_id, record.metadata, events)
         return summaries
 
     def _binary_cache_path(self, trace_id: str) -> Path:
         return self.paths.cache_dir / f"{trace_id}{BINARY_CACHE_SUFFIX}"
+
+    @staticmethod
+    def _normalize_source_filters(
+        source_filters: Optional[set[tuple[int, BusType]]],
+    ) -> Optional[set[tuple[int, BusType]]]:
+        if not source_filters:
+            return None
+        normalized: set[tuple[int, BusType]] = set()
+        for source_channel, bus_type in source_filters:
+            normalized.add((int(source_channel), bus_type if isinstance(bus_type, BusType) else BusType(bus_type)))
+        return normalized or None
+
+    @staticmethod
+    def _filter_trace_events_by_source(
+        events,
+        source_filters: Optional[set[tuple[int, BusType]]],
+    ):
+        if not source_filters:
+            return list(events)
+        return [
+            event
+            for event in events
+            if (int(event.channel), event.bus_type) in source_filters
+        ]
 
     def _write_binary_cache(
         self,
@@ -245,22 +297,34 @@ class FileLibraryService:
         updated_metadata["cache_format"] = BINARY_CACHE_FORMAT
         self._update_trace_metadata(trace_id, updated_metadata)
 
-    def _ensure_trace_source_summaries(
+    def _ensure_trace_summary_metadata(
         self,
         trace_id: str,
         metadata: dict,
         events,
-    ) -> list[dict]:
-        existing = self._normalize_trace_source_summaries(metadata.get("source_summaries", []))
-        if existing:
-            return existing
+    ) -> dict[str, list[dict]]:
+        source_summaries = self._normalize_trace_source_summaries(metadata.get("source_summaries", []))
+        message_id_summaries = self._normalize_trace_message_id_summaries(metadata.get("message_id_summaries", []))
+        if source_summaries and message_id_summaries:
+            return {
+                "source_summaries": source_summaries,
+                "message_id_summaries": message_id_summaries,
+            }
         updated_metadata = dict(metadata)
         current_record = self.get_trace_file(trace_id)
         if current_record is not None:
             updated_metadata.update(current_record.metadata)
-        updated_metadata["source_summaries"] = build_trace_source_summaries(events)
+        if not source_summaries:
+            updated_metadata["source_summaries"] = build_trace_source_summaries(events)
+        if not message_id_summaries:
+            updated_metadata["message_id_summaries"] = build_trace_message_id_summaries(events)
         self._update_trace_metadata(trace_id, updated_metadata)
-        return updated_metadata["source_summaries"]
+        return {
+            "source_summaries": self._normalize_trace_source_summaries(updated_metadata.get("source_summaries", [])),
+            "message_id_summaries": self._normalize_trace_message_id_summaries(
+                updated_metadata.get("message_id_summaries", [])
+            ),
+        }
 
     @staticmethod
     def _normalize_trace_source_summaries(raw_items) -> list[dict]:
@@ -285,6 +349,40 @@ class FileLibraryService:
                     "bus_type": str(bus_type),
                     "frame_count": normalized_count,
                     "label": str(label),
+                }
+            )
+        return sorted(items, key=lambda item: (item["source_channel"], item["bus_type"]))
+
+    @staticmethod
+    def _normalize_trace_message_id_summaries(raw_items: Any) -> list[dict]:
+        items: list[dict] = []
+        for raw_item in raw_items or []:
+            if not isinstance(raw_item, dict):
+                continue
+            source_channel = raw_item.get("source_channel")
+            bus_type = raw_item.get("bus_type")
+            frame_count = raw_item.get("frame_count")
+            raw_message_ids = raw_item.get("message_ids", [])
+            if source_channel is None or bus_type in (None, ""):
+                continue
+            try:
+                normalized_channel = int(source_channel)
+                normalized_count = int(frame_count or 0)
+                normalized_message_ids = sorted(
+                    {
+                        int(message_id)
+                        for message_id in raw_message_ids
+                        if message_id not in (None, "")
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+            items.append(
+                {
+                    "source_channel": normalized_channel,
+                    "bus_type": str(bus_type),
+                    "frame_count": normalized_count,
+                    "message_ids": normalized_message_ids,
                 }
             )
         return sorted(items, key=lambda item: (item["source_channel"], item["bus_type"]))

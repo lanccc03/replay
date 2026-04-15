@@ -5,13 +5,15 @@ from pathlib import Path
 
 import tests.bootstrap  # noqa: F401
 
-from replay_platform.core import ScenarioSpec
+from replay_platform.core import BusType, ScenarioSpec
 from replay_platform.paths import AppPaths
 from replay_platform.services.library import FileLibraryService
 from replay_platform.services.trace_loader import BINARY_CACHE_FORMAT, TraceLoader
 
 
 class FileLibraryTests(unittest.TestCase):
+    EXTENDED_SAMPLE_MESSAGE_ID = 0x123 | (1 << 31)
+
     def test_import_trace_and_save_scenario(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,6 +54,28 @@ class FileLibraryTests(unittest.TestCase):
             self.assertIn("frame_count", source_summaries[0])
             self.assertIn("label", source_summaries[0])
 
+    def test_import_trace_writes_message_id_summaries(self):
+        fixture = Path(__file__).parent / "fixtures" / "sample.asc"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = FileLibraryService(AppPaths(Path(tmp)), TraceLoader())
+            record = service.import_trace(str(fixture))
+
+            message_id_summaries = record.metadata.get("message_id_summaries", [])
+
+            self.assertTrue(message_id_summaries)
+            self.assertEqual(
+                [
+                    {
+                        "source_channel": 0,
+                        "bus_type": "CAN",
+                        "frame_count": 1,
+                        "message_ids": [self.EXTENDED_SAMPLE_MESSAGE_ID],
+                    },
+                    {"source_channel": 1, "bus_type": "CAN", "frame_count": 1, "message_ids": [0x456]},
+                ],
+                message_id_summaries,
+            )
+
     def test_load_trace_events_migrates_legacy_json_cache(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,6 +101,35 @@ class FileLibraryTests(unittest.TestCase):
             self.assertTrue(Path(migrated.metadata["cache_path"]).exists())
             self.assertEqual(".rplbin", Path(migrated.metadata["cache_path"]).suffix)
 
+    def test_load_trace_events_can_filter_binary_cache_by_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "mixed.asc"
+            fixture.write_text(
+                "\n".join(
+                    [
+                        "date Tue Apr 15 12:00:00.000 2026",
+                        "base hex  timestamps absolute",
+                        "0.100000 1 120 Rx d 1 01",
+                        "0.200000 2 121 Rx d 1 02",
+                        "0.300000 CANFD 1 Rx 44D 0 0 A 2 03 04",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            service = FileLibraryService(AppPaths(root), TraceLoader())
+            record = service.import_trace(str(fixture))
+
+            filtered = service.load_trace_events(
+                record.trace_id,
+                source_filters={(1, BusType.CAN)},
+            )
+
+            self.assertEqual(1, len(filtered))
+            self.assertEqual(BusType.CAN, filtered[0].bus_type)
+            self.assertEqual(1, filtered[0].channel)
+            self.assertEqual(0x121, filtered[0].message_id)
+
     def test_get_trace_source_summaries_backfills_missing_metadata(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,6 +147,25 @@ class FileLibraryTests(unittest.TestCase):
             self.assertTrue(summaries)
             assert refreshed is not None
             self.assertEqual(summaries, refreshed.metadata["source_summaries"])
+
+    def test_get_trace_message_id_summaries_backfills_missing_metadata(self):
+        fixture = Path(__file__).parent / "fixtures" / "sample.asc"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = FileLibraryService(AppPaths(Path(tmp)), TraceLoader())
+            record = service.import_trace(str(fixture))
+            with service._connect() as connection:
+                connection.execute(
+                    "UPDATE trace_files SET metadata_json = ? WHERE trace_id = ?",
+                    (json.dumps({"cache_path": record.metadata["cache_path"], "cache_format": BINARY_CACHE_FORMAT}), record.trace_id),
+                )
+
+            summaries = service.get_trace_message_id_summaries(record.trace_id)
+            refreshed = service.get_trace_file(record.trace_id)
+
+            self.assertTrue(summaries)
+            self.assertEqual([self.EXTENDED_SAMPLE_MESSAGE_ID], summaries[0]["message_ids"])
+            assert refreshed is not None
+            self.assertEqual(summaries, refreshed.metadata["message_id_summaries"])
 
     def test_delete_trace_removes_record_library_file_and_cache(self):
         fixture = Path(__file__).parent / "fixtures" / "sample.asc"

@@ -37,6 +37,7 @@ from replay_platform.services.signal_catalog import SignalOverrideService
 
 FRAME_SLICE_WINDOW_NS = 2_000_000
 FRAME_SCHEDULE_WINDOW_NS = FRAME_SLICE_WINDOW_NS
+ADAPTER_HEALTH_REFRESH_INTERVAL_NS = 100_000_000
 STARTUP_SYNC_TIMEOUT_MS = 100
 STARTUP_SYNC_MESSAGE_ID = 0x1
 STARTUP_SYNC_DLC = 8
@@ -90,9 +91,13 @@ class ReplayEngine:
         self._completed_loops = 0
         self._stats_lock = threading.Lock()
         self._snapshot_lock = threading.Lock()
+        self._adapter_health_lock = threading.Lock()
         self._completion_cleanup_lock = threading.Lock()
         self._frame_log_counts: Dict[str, int] = {}
         self._completion_cleanup_pending = False
+        self._adapter_health_refresh_interval_ns = ADAPTER_HEALTH_REFRESH_INTERVAL_NS
+        self._last_adapter_health_refresh_ns = 0
+        self._cached_adapter_health: Dict[str, AdapterHealth] = {}
         self._runtime_snapshot = ReplayRuntimeSnapshot()
 
     def configure(
@@ -121,6 +126,7 @@ class ReplayEngine:
         self._pause_started_ns = 0
         self.stats = ReplayStats()
         self._frame_log_counts.clear()
+        self._reset_adapter_health_cache()
         with self._diagnostic_condition:
             self._diagnostic_queue.clear()
             self._diagnostic_stop_requested = False
@@ -130,7 +136,7 @@ class ReplayEngine:
             total_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
             timeline_index=0,
             timeline_size=len(self._timeline),
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
             launch_source=launch_source,
             loop_enabled=self._loop_enabled,
             completed_loops=self._completed_loops,
@@ -149,7 +155,7 @@ class ReplayEngine:
         self._startup_sync_pending = True
         self._update_runtime_snapshot(
             state=self.state,
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
         )
         self._thread = threading.Thread(target=self._run_loop, name="replay-engine", daemon=True)
         self._thread.start()
@@ -164,7 +170,7 @@ class ReplayEngine:
             self._condition.notify_all()
         self._update_runtime_snapshot(
             state=self.state,
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
         )
         self._log_info("回放已暂停。")
 
@@ -182,7 +188,7 @@ class ReplayEngine:
             self._condition.notify_all()
         self._update_runtime_snapshot(
             state=self.state,
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
         )
         self._log_info("回放已继续。")
 
@@ -208,7 +214,7 @@ class ReplayEngine:
             timeline_index=0,
             current_item_kind=None,
             current_source_file="",
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
         )
         self._log_info("回放已停止。")
 
@@ -248,7 +254,7 @@ class ReplayEngine:
         self._thread = None
         self._teardown_adapters()
         self._update_runtime_snapshot(
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
         )
         return True
 
@@ -372,7 +378,7 @@ class ReplayEngine:
                 state=self.state,
                 current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
                 timeline_index=len(self._timeline),
-                adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+                adapter_health=self._adapter_health_snapshot(force=True),
             )
             self._log_info("回放已完成。")
             return False
@@ -390,7 +396,7 @@ class ReplayEngine:
                 state=self.state,
                 current_ts_ns=self._timeline[-1].ts_ns if self._timeline else 0,
                 timeline_index=len(self._timeline),
-                adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+                adapter_health=self._adapter_health_snapshot(force=True),
             )
             self._log_info("回放已停止。")
             return False
@@ -410,7 +416,7 @@ class ReplayEngine:
             timeline_index=0,
             current_item_kind=None,
             current_source_file="",
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(force=True),
             completed_loops=self._completed_loops,
         )
         self._log_info(f"循环回放：进入第 {self._completed_loops + 1} 圈。")
@@ -847,6 +853,24 @@ class ReplayEngine:
         with self._snapshot_lock:
             self._runtime_snapshot = replace(self._runtime_snapshot, **updates)
 
+    def _reset_adapter_health_cache(self) -> None:
+        with self._adapter_health_lock:
+            self._cached_adapter_health = {}
+            self._last_adapter_health_refresh_ns = 0
+
+    def _adapter_health_snapshot(self, *, force: bool = False, now_ns: Optional[int] = None) -> Dict[str, AdapterHealth]:
+        if now_ns is None:
+            now_ns = time.perf_counter_ns()
+        with self._adapter_health_lock:
+            should_refresh = force or not self._cached_adapter_health
+            if not should_refresh:
+                interval_ns = self._adapter_health_refresh_interval_ns
+                should_refresh = interval_ns <= 0 or now_ns - self._last_adapter_health_refresh_ns >= interval_ns
+            if should_refresh:
+                self._cached_adapter_health = self._copy_adapter_health_map(self._safe_adapter_health_snapshot())
+                self._last_adapter_health_refresh_ns = now_ns
+            return self._copy_adapter_health_map(self._cached_adapter_health)
+
     def _update_runtime_snapshot_for_item(self, item: TimelineItem, timeline_index: int) -> None:
         current_source = ""
         if isinstance(item, FrameEvent):
@@ -861,7 +885,7 @@ class ReplayEngine:
             timeline_index=timeline_index,
             current_item_kind=item.kind,
             current_source_file=current_source,
-            adapter_health=self._copy_adapter_health_map(self._safe_adapter_health_snapshot()),
+            adapter_health=self._adapter_health_snapshot(),
         )
 
     def _safe_adapter_health_snapshot(self) -> Dict[str, AdapterHealth]:
