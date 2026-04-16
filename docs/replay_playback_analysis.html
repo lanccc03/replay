@@ -192,7 +192,7 @@
             <p class="muted" style="margin:14px 0 0;">
               现在这套实现由 <code>ReplayApplication</code> 负责启动前装配，由 <code>ReplayEngine</code>
               负责运行期调度。调度里面最关键的几个点是：多 trace 合并排序、统一时间轴、2ms 帧分片、20ms 计划发送观察窗、
-              帧使能过滤、发送前信号覆盖、逻辑通道到物理通道映射、暂停恢复时钟平移，以及循环回放时的通道重初始化。
+              帧使能过滤、发送前信号覆盖、逻辑通道到物理通道映射、暂停恢复时钟平移，以及循环回放时的软重置与链路状态继承。
             </p>
             <div class="stats">
               <div class="stat">
@@ -578,14 +578,18 @@
             <tr>
               <td>循环播放</td>
               <td><code>_restart_loop_playback()</code></td>
-              <td>完成圈数 +1，重开适配器与通道，索引归零，重新记录 <code>_base_perf_ns</code></td>
+              <td>完成圈数 +1，仅重置索引与运行时钟基准，并保留当前适配器/通道状态</td>
               <td>继续保持 <code>RUNNING</code> 并进入下一圈</td>
             </tr>
           </tbody>
         </table>
         <div class="callout note" style="margin-top:14px;">
-          <strong>循环回放不是简单“把索引拨回 0”</strong>
-          当前实现会先执行 <code>_teardown_adapters()</code> 再执行 <code>_prepare_channels()</code>，所以跨圈的本质是“重新初始化通道后重播”。
+          <strong>循环回放现在就是“把索引拨回 0 并重置时钟”</strong>
+          当前实现会直接重置 <code>_timeline_index</code> 和 <code>_base_perf_ns</code>，不会在跨圈时重新执行 <code>_teardown_adapters()</code> 或 <code>_prepare_channels()</code>。
+        </div>
+        <div class="callout warn" style="margin-top:14px;">
+          <strong>循环跨圈会继承上一圈结束时的链路状态</strong>
+          如果上一圈末尾已经通过 <code>LinkActionType.DISCONNECT</code> 让某个通道停掉，那么下一圈开始时不会自动恢复；只有时间轴里的后续 <code>RECONNECT</code>，或者用户手动 stop/start，才会重新恢复通道。
         </div>
         <div class="callout warn" style="margin-top:14px;">
           <strong>运行态帧禁用规则要分两层理解</strong>
@@ -686,8 +690,8 @@
             </tr>
             <tr>
               <td>循环跨圈</td>
-              <td>会重开适配器和通道，再从索引 0 重播</td>
-              <td>不是单纯把索引改回 0</td>
+              <td>只会软重置索引和时钟，再从索引 0 重播</td>
+              <td>会继承上一圈结束时的链路状态，不再自动重开通道</td>
             </tr>
             <tr>
               <td>部分发送</td>
@@ -776,9 +780,14 @@
               <td>验证 loop 模式里的 pause / resume / stop 依旧有效</td>
             </tr>
             <tr>
-              <td>循环跨圈会重新初始化通道</td>
-              <td><code>tests/test_engine.py:281</code></td>
-              <td>验证 completed_loops 增长且发送统计累加</td>
+              <td>循环跨圈只做软重置并继承断链状态</td>
+              <td><code>tests/test_engine.py</code></td>
+              <td>验证 completed_loops 增长，且断链后下一圈不会自动恢复通道</td>
+            </tr>
+            <tr>
+              <td>连续 loop 会话只在首次 start 做 startup sync</td>
+              <td><code>tests/test_engine.py</code></td>
+              <td>验证每圈不再重复发送 startup sync，stop/start 才会重新发送</td>
             </tr>
             <tr>
               <td>跨圈保留运行态帧禁用规则</td>

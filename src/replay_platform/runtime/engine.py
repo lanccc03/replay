@@ -404,11 +404,11 @@ class ReplayEngine:
 
     def _restart_loop_playback(self) -> None:
         self._completed_loops += 1
-        self._teardown_adapters()
-        self._prepare_channels()
         self._timeline_index = 0
-        self._arm_start_anchor()
-        self._startup_sync_pending = True
+        self._base_perf_ns = time.perf_counter_ns()
+        self._clear_start_anchor()
+        self._startup_sync_pending = False
+        self._pause_started_ns = 0
         self._frame_log_counts.clear()
         self._update_runtime_snapshot(
             state=self.state,
