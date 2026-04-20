@@ -196,6 +196,231 @@ class ScenarioEditorDialogTests(unittest.TestCase):
                 dialog.close()
                 dialog.deleteLater()
 
+    def test_inline_database_binding_loads_for_selected_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog.app_logic.rebuild_override_preview = Mock(  # type: ignore[method-assign]
+                    return_value={0: {"loaded": False, "error": "missing dbc"}}
+                )
+                dbc_path = str(Path(workspace) / "vehicle.dbc")
+
+                dialog.load_payload(
+                    {
+                        "scenario_id": "scenario-1",
+                        "name": "数据库内联",
+                        "trace_file_ids": [],
+                        "bindings": [
+                            {
+                                "adapter_id": "mock0",
+                                "driver": "mock",
+                                "logical_channel": 0,
+                                "physical_channel": 0,
+                                "bus_type": "CANFD",
+                                "device_type": "MOCK",
+                            }
+                        ],
+                        "database_bindings": [
+                            {"logical_channel": 0, "path": dbc_path, "format": "dbc"},
+                        ],
+                        "signal_overrides": [],
+                        "diagnostic_targets": [],
+                        "diagnostic_actions": [],
+                        "link_actions": [],
+                        "metadata": {},
+                    }
+                )
+
+                self.assertEqual("0", dialog.binding_database_channel_edit.text())
+                self.assertEqual(dbc_path, dialog.binding_database_path_edit.text())
+                self.assertIn("vehicle.dbc", dialog.binding_database_status_label.text())
+                self.assertIn("vehicle.dbc", dialog.binding_list.item(0).text())
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_inline_database_binding_exports_compatible_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog._draft_bindings = [_new_binding_draft(0)]
+                dialog._refresh_binding_list(select_index=0)
+                dbc_path = str(Path(workspace) / "inline.dbc")
+
+                dialog.binding_database_path_edit.setText(dbc_path)
+                dialog._apply_current_database_binding_path(refresh_status=False)
+
+                result = dialog._validate_current_draft()
+
+                self.assertEqual([], result.errors)
+                self.assertIsNotNone(result.normalized_payload)
+                self.assertEqual(
+                    [{"logical_channel": 0, "path": dbc_path, "format": "dbc"}],
+                    result.normalized_payload["database_bindings"],
+                )
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_logical_channel_change_switches_inline_database_binding_without_moving_old_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                draft = _new_binding_draft(0)
+                dialog._draft_bindings = [draft]
+                dialog._database_binding_drafts = {
+                    0: {"logical_channel": 0, "path": str(Path(workspace) / "lc0.dbc"), "format": "dbc"},
+                    1: {"logical_channel": 1, "path": str(Path(workspace) / "lc1.dbc"), "format": "dbc"},
+                }
+                dialog._refresh_binding_list(select_index=0)
+
+                self.assertTrue(dialog.binding_database_path_edit.text().endswith("lc0.dbc"))
+
+                dialog.binding_logical_channel_edit.setText("1")
+                dialog._binding_input_changed()
+
+                self.assertTrue(dialog.binding_database_path_edit.text().endswith("lc1.dbc"))
+                self.assertTrue(dialog._database_binding_drafts[0]["path"].endswith("lc0.dbc"))
+                self.assertEqual("1", dialog._draft_bindings[0]["logical_channel"])
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_removing_last_binding_prunes_inline_database_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog._draft_bindings = [_new_binding_draft(0)]
+                dialog._database_binding_drafts = {
+                    0: {"logical_channel": 0, "path": str(Path(workspace) / "lc0.dbc"), "format": "dbc"}
+                }
+                dialog._refresh_binding_list(select_index=0)
+
+                dialog._remove_selected_binding()
+
+                self.assertEqual([], dialog._draft_bindings)
+                self.assertNotIn(0, dialog._database_binding_drafts)
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_duplicate_database_bindings_warn_and_save_last_value(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog.app_logic.rebuild_override_preview = Mock(return_value={0: {"loaded": False, "error": "missing"}})  # type: ignore[method-assign]
+                first_path = str(Path(workspace) / "first.dbc")
+                last_path = str(Path(workspace) / "last.dbc")
+
+                dialog.load_payload(
+                    {
+                        "scenario_id": "scenario-1",
+                        "name": "重复数据库绑定",
+                        "trace_file_ids": [],
+                        "bindings": [
+                            {
+                                "adapter_id": "mock0",
+                                "driver": "mock",
+                                "logical_channel": 0,
+                                "physical_channel": 0,
+                                "bus_type": "CANFD",
+                                "device_type": "MOCK",
+                            }
+                        ],
+                        "database_bindings": [
+                            {"logical_channel": 0, "path": first_path, "format": "dbc"},
+                            {"logical_channel": 0, "path": last_path, "format": "dbc"},
+                        ],
+                        "signal_overrides": [],
+                        "diagnostic_targets": [],
+                        "diagnostic_actions": [],
+                        "link_actions": [],
+                        "metadata": {},
+                    }
+                )
+
+                result = dialog._validate_current_draft()
+
+                self.assertEqual([], result.errors)
+                self.assertIsNotNone(result.normalized_payload)
+                self.assertEqual(
+                    [{"logical_channel": 0, "path": last_path, "format": "dbc"}],
+                    result.normalized_payload["database_bindings"],
+                )
+                self.assertTrue(any("LC0" in warning.message for warning in result.warnings))
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_orphan_database_bindings_are_listed_and_removable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog.app_logic.rebuild_override_preview = Mock(return_value={4: {"loaded": False, "error": "missing"}})  # type: ignore[method-assign]
+                orphan_path = str(Path(workspace) / "orphan.dbc")
+
+                dialog.load_payload(
+                    {
+                        "scenario_id": "scenario-1",
+                        "name": "孤立数据库绑定",
+                        "trace_file_ids": [],
+                        "bindings": [],
+                        "database_bindings": [
+                            {"logical_channel": 4, "path": orphan_path, "format": "dbc"},
+                        ],
+                        "signal_overrides": [],
+                        "diagnostic_targets": [],
+                        "diagnostic_actions": [],
+                        "link_actions": [],
+                        "metadata": {},
+                    }
+                )
+
+                self.assertEqual(1, dialog.orphan_database_list.count())
+                self.assertIn("orphan.dbc", dialog.orphan_database_label.text())
+
+                dialog.orphan_database_list.setCurrentRow(0)
+                dialog._update_orphan_database_buttons()
+                self.assertTrue(dialog.remove_orphan_database_button.isEnabled())
+
+                dialog._remove_selected_orphan_database_binding()
+
+                self.assertEqual(0, dialog.orphan_database_list.count())
+                self.assertNotIn(4, dialog._database_binding_drafts)
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

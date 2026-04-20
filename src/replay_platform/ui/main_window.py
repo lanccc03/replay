@@ -879,6 +879,116 @@ def _database_binding_summary(item: dict, label_map: Optional[dict[int, str]] = 
     return f"{channel_text} | {fmt} | {path}"
 
 
+def _database_binding_map_from_items(items: Sequence[dict]) -> tuple[dict[int, dict], dict[int, int]]:
+    mapping: dict[int, dict] = {}
+    duplicate_counts: dict[int, int] = {}
+    for item in items:
+        logical_channel = _parse_optional_int_text(item.get("logical_channel"))
+        if logical_channel is None:
+            continue
+        normalized_item = {
+            "logical_channel": logical_channel,
+            "path": _display_text(item.get("path", "")).strip(),
+            "format": _display_text(item.get("format", "")).strip() or "dbc",
+        }
+        if logical_channel in mapping:
+            duplicate_counts[logical_channel] = duplicate_counts.get(logical_channel, 1) + 1
+        mapping[logical_channel] = normalized_item
+    return mapping, duplicate_counts
+
+
+def _database_binding_items_from_map(binding_map: dict[int, dict]) -> list[dict]:
+    items: list[dict] = []
+    for logical_channel in sorted(binding_map):
+        item = binding_map[logical_channel]
+        path = _display_text(item.get("path", "")).strip()
+        if not path:
+            continue
+        items.append(
+            {
+                "logical_channel": logical_channel,
+                "path": path,
+                "format": _display_text(item.get("format", "")).strip() or "dbc",
+            }
+        )
+    return items
+
+
+def _database_binding_orphan_items(binding_map: dict[int, dict], bindings: Sequence[dict]) -> list[dict]:
+    used_channels = {
+        logical_channel
+        for logical_channel in (_parse_optional_int_text(item.get("logical_channel")) for item in bindings)
+        if logical_channel is not None
+    }
+    return [
+        dict(binding_map[logical_channel])
+        for logical_channel in sorted(binding_map)
+        if logical_channel not in used_channels and _display_text(binding_map[logical_channel].get("path", "")).strip()
+    ]
+
+
+def _database_binding_file_name(item: Optional[dict]) -> str:
+    if not item:
+        return "未绑定DBC"
+    path = _display_text(item.get("path", "")).strip()
+    if not path:
+        return "未绑定DBC"
+    return Path(path).name or path
+
+
+def _database_binding_status_summary(item: Optional[dict], status: Optional[dict]) -> str:
+    file_name = _database_binding_file_name(item)
+    if not item or not _display_text(item.get("path", "")).strip():
+        return file_name
+    if not status:
+        return file_name
+    if status.get("loaded"):
+        return f"{file_name}（已加载）"
+    return f"{file_name}（加载失败）"
+
+
+def _database_binding_status_detail(item: Optional[dict], status: Optional[dict]) -> str:
+    if not item or not _display_text(item.get("path", "")).strip():
+        return "状态：当前逻辑通道未绑定DBC。"
+    file_name = _database_binding_file_name(item)
+    if not status:
+        return f"状态：已选择 {file_name}，尚未执行加载预览。"
+    if status.get("loaded"):
+        message_count = int(status.get("message_count", 0))
+        return f"状态：{file_name} 已加载，可用 {message_count} 个报文。"
+    error_text = _display_text(status.get("error", "")).strip() or "未知错误"
+    return f"状态：{file_name} 加载失败：{error_text}"
+
+
+def _resource_mapping_summary(
+    item: dict,
+    trace_lookup: dict[str, TraceFileRecord],
+    *,
+    database_binding: Optional[dict] = None,
+    database_status: Optional[dict] = None,
+) -> str:
+    source_label = _binding_source_label(item, trace_lookup)
+    logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
+    adapter_id = _display_text(item.get("adapter_id", "")).strip() or "未命名适配器"
+    physical_channel = _display_text(item.get("physical_channel", "")).strip() or "?"
+    dbc_text = _database_binding_status_summary(database_binding, database_status)
+    return f"{source_label} -> LC{logical_channel} -> {adapter_id}/PC{physical_channel} | {dbc_text}"
+
+
+def _trace_mapping_completion_text(trace_id: str, bindings: Sequence[dict]) -> str:
+    mapping_count = sum(1 for item in bindings if _display_text(item.get("trace_file_id", "")).strip() == trace_id)
+    if mapping_count <= 0:
+        return "未映射"
+    return f"已映射 {mapping_count} 条源项"
+
+
+def _build_orphan_database_binding_text(orphan_items: Sequence[dict], label_map: Optional[dict[int, str]] = None) -> str:
+    if not orphan_items:
+        return "当前没有孤立DBC绑定。"
+    parts = [_database_binding_summary(item, label_map) for item in orphan_items]
+    return "孤立DBC绑定：" + "；".join(parts)
+
+
 def _signal_override_summary(item: dict, label_map: Optional[dict[int, str]] = None) -> str:
     logical_channel = _display_text(item.get("logical_channel", "")).strip() or "?"
     message_id = _display_text(item.get("message_id_or_pgn", "")).strip() or "?"
@@ -1464,6 +1574,9 @@ def build_main_window(app_logic: ReplayApplication):
             self._binding_error_counts: dict[int, int] = {}
             self._binding_list_error_messages: dict[int, list[str]] = {}
             self._draft_bindings: list[dict] = []
+            self._database_binding_drafts: dict[int, dict] = {}
+            self._database_binding_duplicate_counts: dict[int, int] = {}
+            self._database_binding_statuses: dict[int, dict[str, Any]] = {}
             self._collection_data = {
                 "database_bindings": [],
                 "signal_overrides": [],
@@ -1556,8 +1669,7 @@ def build_main_window(app_logic: ReplayApplication):
             body_layout.setSpacing(14)
 
             self._build_basic_section(body_layout)
-            self._build_trace_section(body_layout)
-            self._build_binding_section(body_layout)
+            self._build_resource_mapping_section(body_layout)
             self._create_summary_list_section(
                 body_layout,
                 key="database_bindings",
@@ -1677,6 +1789,9 @@ def build_main_window(app_logic: ReplayApplication):
                     "metadata": {},
                 },
             )
+            self._collection_sections["database_bindings"]["box"].hide()
+            self._section_boxes.pop("database_bindings", None)
+            self._section_titles.pop("database_bindings", None)
             self._build_metadata_section(body_layout)
             body_layout.addStretch(1)
 
@@ -1699,6 +1814,216 @@ def build_main_window(app_logic: ReplayApplication):
             scenario_name_container = self._make_field_container("场景名称", self.scenario_name_edit, "name")
             layout.addWidget(scenario_name_container[0], 0, 1)
             parent_layout.addWidget(box)
+
+        def _build_resource_mapping_section(self, parent_layout: QVBoxLayout) -> None:
+            box = QGroupBox("资源映射")
+            self._register_section("resources", box, "资源映射")
+            layout = QVBoxLayout(box)
+
+            hint = QLabel("先在上方勾选当前场景使用的回放文件，再在下方配置文件映射与当前逻辑通道的DBC。")
+            hint.setWordWrap(True)
+            hint.setProperty("role", "sectionHint")
+            layout.addWidget(hint)
+
+            self.trace_warning_label = QLabel()
+            self.trace_warning_label.setWordWrap(True)
+            self.trace_warning_label.hide()
+            layout.addWidget(self.trace_warning_label)
+
+            self.binding_warning_label = QLabel()
+            self.binding_warning_label.setWordWrap(True)
+            self.binding_warning_label.hide()
+            layout.addWidget(self.binding_warning_label)
+
+            self.orphan_database_label = QLabel()
+            self.orphan_database_label.setWordWrap(True)
+            self.orphan_database_label.hide()
+            layout.addWidget(self.orphan_database_label)
+
+            self.orphan_database_list = QListWidget()
+            self.orphan_database_list.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.orphan_database_list.itemSelectionChanged.connect(self._update_orphan_database_buttons)
+            self.orphan_database_list.hide()
+            layout.addWidget(self.orphan_database_list)
+
+            orphan_action_row = QHBoxLayout()
+            self.remove_orphan_database_button = QPushButton("移除选中孤立DBC")
+            self.remove_orphan_database_button.clicked.connect(self._remove_selected_orphan_database_binding)
+            self._set_button_variant(self.remove_orphan_database_button, "danger")
+            self.remove_orphan_database_button.hide()
+            orphan_action_row.addWidget(self.remove_orphan_database_button)
+            orphan_action_row.addStretch(1)
+            layout.addLayout(orphan_action_row)
+
+            trace_title = QLabel("场景文件")
+            trace_title.setProperty("role", "sectionHint")
+            layout.addWidget(trace_title)
+
+            self.scenario_trace_list = QListWidget()
+            self.scenario_trace_list.setSelectionMode(QAbstractItemView.NoSelection)
+            self.scenario_trace_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._apply_checkable_list_style_compatibility(self.scenario_trace_list)
+            self.scenario_trace_list.itemChanged.connect(self._handle_user_edit)
+            layout.addWidget(self.scenario_trace_list)
+
+            action_row = QHBoxLayout()
+            self.add_binding_button = QPushButton("新增文件映射")
+            self.add_binding_button.clicked.connect(self._add_binding)
+            self._set_button_variant(self.add_binding_button, "secondary")
+            action_row.addWidget(self.add_binding_button)
+
+            self.remove_binding_button = QPushButton("删除选中")
+            self.remove_binding_button.clicked.connect(self._remove_selected_binding)
+            self._set_button_variant(self.remove_binding_button, "danger")
+            action_row.addWidget(self.remove_binding_button)
+            action_row.addStretch(1)
+            layout.addLayout(action_row)
+
+            content = QWidget()
+            content_layout = QHBoxLayout(content)
+            content_layout.setContentsMargins(0, 0, 0, 0)
+            content_layout.setSpacing(12)
+
+            self.binding_list = QListWidget()
+            self.binding_list.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.binding_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.binding_list.itemSelectionChanged.connect(self._handle_binding_selection_changed)
+            self.binding_list.setMinimumWidth(420)
+            content_layout.addWidget(self.binding_list, 1)
+
+            self.binding_editor_frame = QFrame()
+            self.binding_editor_frame.setObjectName("bindingEditorPanel")
+            editor_layout = QVBoxLayout(self.binding_editor_frame)
+            editor_layout.setContentsMargins(14, 14, 14, 14)
+            editor_layout.setSpacing(10)
+
+            self.binding_editor_hint = QLabel("选择一条文件映射后即可编辑；新增时会优先选中尚未映射的场景文件。")
+            self.binding_editor_hint.setWordWrap(True)
+            self.binding_editor_hint.setProperty("tone", "muted")
+            editor_layout.addWidget(self.binding_editor_hint)
+
+            self.binding_editor_grid = QGridLayout()
+            self.binding_editor_grid.setHorizontalSpacing(12)
+            self.binding_editor_grid.setVerticalSpacing(10)
+            editor_layout.addLayout(self.binding_editor_grid)
+
+            self.binding_trace_file_combo = QComboBox()
+            self._add_binding_field("trace_file_id", "文件", self.binding_trace_file_combo, 0, 0)
+
+            self.binding_source_combo = QComboBox()
+            self._add_binding_field("source_selector", "源项", self.binding_source_combo, 0, 1)
+
+            self.binding_adapter_id_edit = QLineEdit()
+            self._add_binding_field("adapter_id", "适配器ID", self.binding_adapter_id_edit, 1, 0)
+
+            self.binding_driver_combo = QComboBox()
+            self.binding_driver_combo.addItems(list(DRIVER_OPTIONS))
+            self._add_binding_field("driver", "驱动", self.binding_driver_combo, 1, 1)
+
+            self.binding_logical_channel_edit = QLineEdit()
+            self._add_binding_field("logical_channel", "托管逻辑通道", self.binding_logical_channel_edit, 2, 0)
+
+            self.binding_physical_channel_edit = QLineEdit()
+            self._add_binding_field("physical_channel", "物理通道", self.binding_physical_channel_edit, 2, 1)
+
+            self.binding_bus_type_edit = QLineEdit()
+            self.binding_bus_type_edit.setReadOnly(True)
+            self._add_binding_field("bus_type", "总线类型", self.binding_bus_type_edit, 3, 0)
+
+            self.binding_device_type_combo = QComboBox()
+            self.binding_device_type_combo.setEditable(True)
+            self._add_binding_field("device_type", "设备类型", self.binding_device_type_combo, 3, 1)
+
+            self.binding_device_index_edit = QLineEdit()
+            self._add_binding_field("device_index", "设备索引", self.binding_device_index_edit, 4, 0)
+
+            self.binding_sdk_root_edit = QLineEdit()
+            self._add_binding_field("sdk_root", "SDK路径", self.binding_sdk_root_edit, 4, 1)
+
+            self.binding_nominal_baud_edit = QLineEdit()
+            self._add_binding_field("nominal_baud", "仲裁波特率", self.binding_nominal_baud_edit, 5, 0)
+
+            self.binding_data_baud_edit = QLineEdit()
+            self._add_binding_field("data_baud", "数据波特率", self.binding_data_baud_edit, 5, 1)
+
+            self.binding_resistance_checkbox = QCheckBox("开启")
+            self._add_binding_field("resistance_enabled", "终端电阻", self.binding_resistance_checkbox, 6, 0)
+
+            self.binding_listen_only_checkbox = QCheckBox("开启")
+            self._add_binding_field("listen_only", "只听", self.binding_listen_only_checkbox, 6, 1)
+
+            self.binding_tx_echo_checkbox = QCheckBox("开启")
+            self._add_binding_field("tx_echo", "回显", self.binding_tx_echo_checkbox, 7, 0)
+
+            self.binding_merge_receive_checkbox = QCheckBox("开启")
+            self._add_binding_field("merge_receive", "合并接收", self.binding_merge_receive_checkbox, 7, 1)
+
+            self.binding_network_editor = QPlainTextEdit()
+            self.binding_network_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._add_binding_field("network", "网络参数(JSON)", self.binding_network_editor, 8, 0, column_span=2)
+
+            self.binding_metadata_editor = QPlainTextEdit()
+            self.binding_metadata_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._add_binding_field("metadata", "元数据(JSON)", self.binding_metadata_editor, 9, 0, column_span=2)
+
+            self.binding_database_group = QGroupBox("数据库绑定")
+            database_layout = QVBoxLayout(self.binding_database_group)
+            database_layout.setContentsMargins(12, 12, 12, 12)
+            database_layout.setSpacing(8)
+
+            self.binding_database_scope_label = QLabel("当前DBC作用于逻辑通道，共享同通道映射。")
+            self.binding_database_scope_label.setWordWrap(True)
+            self.binding_database_scope_label.setProperty("tone", "muted")
+            database_layout.addWidget(self.binding_database_scope_label)
+
+            database_grid = QGridLayout()
+            database_grid.setHorizontalSpacing(12)
+            database_grid.setVerticalSpacing(10)
+            database_layout.addLayout(database_grid)
+
+            database_channel_label = QLabel("逻辑通道")
+            database_grid.addWidget(database_channel_label, 0, 0)
+            self.binding_database_channel_edit = QLineEdit()
+            self.binding_database_channel_edit.setReadOnly(True)
+            database_grid.addWidget(self.binding_database_channel_edit, 0, 1)
+
+            database_format_label = QLabel("格式")
+            database_grid.addWidget(database_format_label, 0, 2)
+            self.binding_database_format_edit = QLineEdit("dbc")
+            self.binding_database_format_edit.setReadOnly(True)
+            database_grid.addWidget(self.binding_database_format_edit, 0, 3)
+
+            database_path_label = QLabel("DBC文件")
+            database_grid.addWidget(database_path_label, 1, 0)
+            path_row = QWidget()
+            path_row_layout = QHBoxLayout(path_row)
+            path_row_layout.setContentsMargins(0, 0, 0, 0)
+            path_row_layout.setSpacing(8)
+            self.binding_database_path_edit = QLineEdit()
+            path_row_layout.addWidget(self.binding_database_path_edit, 1)
+            self.binding_database_browse_button = QPushButton("浏览")
+            self.binding_database_browse_button.clicked.connect(self._browse_binding_database_path)
+            self._set_button_variant(self.binding_database_browse_button, "secondary")
+            path_row_layout.addWidget(self.binding_database_browse_button)
+            self.binding_database_clear_button = QPushButton("清空")
+            self.binding_database_clear_button.clicked.connect(self._clear_binding_database_path)
+            self._set_button_variant(self.binding_database_clear_button, "secondary")
+            path_row_layout.addWidget(self.binding_database_clear_button)
+            database_grid.addWidget(path_row, 1, 1, 1, 3)
+
+            self.binding_database_status_label = QLabel("状态：当前逻辑通道未绑定DBC。")
+            self.binding_database_status_label.setWordWrap(True)
+            database_layout.addWidget(self.binding_database_status_label)
+
+            editor_layout.addWidget(self.binding_database_group)
+            content_layout.addWidget(self.binding_editor_frame, 2)
+            layout.addWidget(content)
+            parent_layout.addWidget(box)
+
+            self.binding_database_path_edit.textChanged.connect(self._handle_binding_database_path_text_changed)
+            self.binding_database_path_edit.editingFinished.connect(self._handle_binding_database_path_editing_finished)
+            self._set_binding_editor_enabled(False)
+            self._update_orphan_database_buttons()
 
         def _build_trace_section(self, parent_layout: QVBoxLayout) -> None:
             box = QGroupBox("场景文件")
@@ -2134,7 +2459,10 @@ def build_main_window(app_logic: ReplayApplication):
             self._suspend_updates = True
             self._validation_timer.stop()
             self._draft_bindings = [_binding_draft_from_item(item) for item in normalized.get("bindings", [])]
-            self._collection_data["database_bindings"] = _clone_jsonable(normalized.get("database_bindings", []))
+            self._database_binding_drafts, self._database_binding_duplicate_counts = _database_binding_map_from_items(
+                _clone_jsonable(normalized.get("database_bindings", []))
+            )
+            self._collection_data["database_bindings"] = []
             self._collection_data["signal_overrides"] = _clone_jsonable(normalized.get("signal_overrides", []))
             self._collection_data["diagnostic_targets"] = _clone_jsonable(normalized.get("diagnostic_targets", []))
             self._collection_data["diagnostic_actions"] = _clone_jsonable(normalized.get("diagnostic_actions", []))
@@ -2145,8 +2473,10 @@ def build_main_window(app_logic: ReplayApplication):
             self.metadata_editor.setPlainText(_format_json_text(normalized.get("metadata", {})))
             self._sync_text_edit_height(self.metadata_editor, min_lines=4)
             self._populate_trace_choices(set(normalized.get("trace_file_ids", [])))
+            self._refresh_database_binding_statuses()
             self._refresh_all_collection_lists()
             self._refresh_binding_list(select_index=0 if self._draft_bindings else None)
+            self._refresh_orphan_database_bindings()
             self._last_saved_payload = _clone_jsonable(normalized)
             self._last_valid_payload = _clone_jsonable(normalized)
             self._validation_errors = []
@@ -2221,7 +2551,20 @@ def build_main_window(app_logic: ReplayApplication):
                 item.setCheckState(Qt.CheckState.Checked)
                 item.setForeground(QColor("#b45309"))
                 self.scenario_trace_list.addItem(item)
+            self._refresh_trace_choice_labels()
             self._sync_list_height(self.scenario_trace_list, min_rows=3)
+
+        def _refresh_trace_choice_labels(self) -> None:
+            existing = {record.trace_id: record for record in self.app_logic.list_traces()}
+            for index in range(self.scenario_trace_list.count()):
+                item = self.scenario_trace_list.item(index)
+                trace_id = _display_text(item.data(USER_ROLE)).strip()
+                mapping_text = _trace_mapping_completion_text(trace_id, self._draft_bindings)
+                record = existing.get(trace_id)
+                if record is None:
+                    item.setText(f"缺失文件 | {trace_id} | {mapping_text}")
+                    continue
+                item.setText(f"{record.name} | {record.format.upper()} | {record.event_count} 帧 | {mapping_text}")
 
         def _checked_trace_ids(self) -> list[str]:
             trace_ids = []
@@ -2268,6 +2611,183 @@ def build_main_window(app_logic: ReplayApplication):
                 return []
             self._trace_source_summary_cache[trace_id] = summaries
             return [dict(item) for item in summaries]
+
+        def _database_binding_items(self) -> list[dict]:
+            return _database_binding_items_from_map(self._database_binding_drafts)
+
+        def _database_binding_for_channel(self, logical_channel: Optional[int]) -> Optional[dict]:
+            if logical_channel is None:
+                return None
+            binding = self._database_binding_drafts.get(int(logical_channel))
+            return dict(binding) if binding is not None else None
+
+        def _set_database_binding_for_channel(self, logical_channel: Optional[int], path: str) -> None:
+            if logical_channel is None:
+                return
+            normalized_path = _display_text(path).strip()
+            if not normalized_path:
+                self._database_binding_drafts.pop(int(logical_channel), None)
+                self._database_binding_statuses.pop(int(logical_channel), None)
+                return
+            self._database_binding_drafts[int(logical_channel)] = {
+                "logical_channel": int(logical_channel),
+                "path": normalized_path,
+                "format": "dbc",
+            }
+
+        def _database_binding_channel_usage_count(self, logical_channel: Optional[int]) -> int:
+            if logical_channel is None:
+                return 0
+            return sum(
+                1
+                for item in self._draft_bindings
+                if _parse_optional_int_text(item.get("logical_channel")) == int(logical_channel)
+            )
+
+        def _prune_database_binding_for_channel_if_unused(self, logical_channel: Optional[int]) -> None:
+            if logical_channel is None:
+                return
+            if self._database_binding_channel_usage_count(logical_channel) > 0:
+                return
+            self._database_binding_drafts.pop(int(logical_channel), None)
+            self._database_binding_statuses.pop(int(logical_channel), None)
+
+        def _refresh_database_binding_statuses(self) -> None:
+            items = self._database_binding_items()
+            if not items:
+                self._database_binding_statuses = {}
+                return
+            statuses = self.app_logic.rebuild_override_preview(
+                [DatabaseBinding(**item) for item in items]
+            )
+            self._database_binding_statuses = {int(key): dict(value) for key, value in statuses.items()}
+
+        def _current_binding_logical_channel(self) -> Optional[int]:
+            index = self.binding_list.currentRow()
+            if index < 0 or index >= len(self._draft_bindings):
+                return None
+            return _parse_optional_int_text(self._draft_bindings[index].get("logical_channel"))
+
+        def _refresh_orphan_database_bindings(self) -> None:
+            orphan_items = _database_binding_orphan_items(self._database_binding_drafts, self._draft_bindings)
+            if not orphan_items:
+                self.orphan_database_label.clear()
+                self.orphan_database_label.hide()
+                self.orphan_database_list.clear()
+                self.orphan_database_list.hide()
+                self.remove_orphan_database_button.hide()
+                return
+            label_map = self._collection_label_map()
+            self.orphan_database_label.setText(_build_orphan_database_binding_text(orphan_items, label_map))
+            self.orphan_database_label.setProperty("tone", "warn")
+            self._refresh_style(self.orphan_database_label)
+            self.orphan_database_label.show()
+            self.orphan_database_list.clear()
+            for item in orphan_items:
+                summary = _database_binding_summary(item, label_map)
+                orphan_item = QListWidgetItem(summary)
+                orphan_item.setData(USER_ROLE, int(item["logical_channel"]))
+                self.orphan_database_list.addItem(orphan_item)
+            self._sync_list_height(self.orphan_database_list, min_rows=1)
+            self.orphan_database_list.show()
+            self.remove_orphan_database_button.show()
+            self._update_orphan_database_buttons()
+
+        def _update_orphan_database_buttons(self) -> None:
+            if not hasattr(self, "remove_orphan_database_button"):
+                return
+            self.remove_orphan_database_button.setEnabled(self.orphan_database_list.currentRow() >= 0)
+
+        def _remove_selected_orphan_database_binding(self) -> None:
+            index = self.orphan_database_list.currentRow()
+            if index < 0:
+                return
+            item = self.orphan_database_list.item(index)
+            logical_channel = _parse_optional_int_text(item.data(USER_ROLE))
+            if logical_channel is None:
+                return
+            self._database_binding_drafts.pop(logical_channel, None)
+            self._database_binding_statuses.pop(logical_channel, None)
+            self._refresh_binding_list(select_index=self.binding_list.currentRow(), reload_editor=False)
+            self._refresh_orphan_database_bindings()
+            self._mark_dirty_and_schedule_validation(immediate=True)
+
+        def _refresh_binding_database_editor(self, logical_channel: Optional[int]) -> None:
+            if logical_channel is None:
+                self.binding_database_channel_edit.clear()
+                self.binding_database_path_edit.clear()
+                self.binding_database_status_label.setText("状态：当前逻辑通道未绑定DBC。")
+                self.binding_database_scope_label.setText("当前DBC作用于逻辑通道，共享同通道映射。")
+                self.binding_database_clear_button.setEnabled(False)
+                self.binding_database_browse_button.setEnabled(False)
+                self.binding_database_path_edit.setEnabled(False)
+                return
+
+            binding = self._database_binding_for_channel(logical_channel)
+            status = self._database_binding_statuses.get(int(logical_channel))
+            usage_count = self._database_binding_channel_usage_count(logical_channel)
+            self.binding_database_channel_edit.setText(str(logical_channel))
+            self.binding_database_path_edit.setEnabled(True)
+            self.binding_database_browse_button.setEnabled(True)
+            self.binding_database_path_edit.setText(_display_text((binding or {}).get("path", "")))
+            self.binding_database_status_label.setText(_database_binding_status_detail(binding, status))
+            if usage_count > 1:
+                self.binding_database_scope_label.setText(
+                    f"当前DBC作用于LC{logical_channel}，已有 {usage_count} 条文件映射共享该通道。"
+                )
+            else:
+                self.binding_database_scope_label.setText(f"当前DBC作用于LC{logical_channel}。")
+            self.binding_database_clear_button.setEnabled(bool(binding))
+
+        def _apply_current_database_binding_path(self, *, refresh_status: bool) -> None:
+            logical_channel = self._current_binding_logical_channel()
+            self._set_database_binding_for_channel(logical_channel, self.binding_database_path_edit.text())
+            if refresh_status:
+                self._refresh_database_binding_statuses()
+            self._refresh_binding_list(select_index=self.binding_list.currentRow(), reload_editor=False)
+            self._refresh_orphan_database_bindings()
+            self._refresh_binding_database_editor(logical_channel)
+
+        def _handle_binding_database_path_text_changed(self, *_args) -> None:
+            if self._suspend_updates:
+                return
+            self._apply_current_database_binding_path(refresh_status=False)
+            self._mark_dirty_and_schedule_validation()
+
+        def _handle_binding_database_path_editing_finished(self) -> None:
+            if self._suspend_updates:
+                return
+            self._apply_current_database_binding_path(refresh_status=True)
+            self._mark_dirty_and_schedule_validation(immediate=True)
+
+        def _browse_binding_database_path(self) -> None:
+            logical_channel = self._current_binding_logical_channel()
+            if logical_channel is None:
+                return
+            initial_dir = _display_text(self.binding_database_path_edit.text()).strip()
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择DBC文件",
+                initial_dir,
+                "DBC文件 (*.dbc);;所有文件 (*.*)",
+            )
+            if not path:
+                return
+            self.binding_database_path_edit.setText(path)
+            self._apply_current_database_binding_path(refresh_status=True)
+            self._mark_dirty_and_schedule_validation(immediate=True)
+
+        def _clear_binding_database_path(self) -> None:
+            logical_channel = self._current_binding_logical_channel()
+            if logical_channel is None:
+                return
+            self.binding_database_path_edit.clear()
+            self._database_binding_drafts.pop(logical_channel, None)
+            self._database_binding_statuses.pop(logical_channel, None)
+            self._refresh_binding_list(select_index=self.binding_list.currentRow(), reload_editor=False)
+            self._refresh_orphan_database_bindings()
+            self._refresh_binding_database_editor(logical_channel)
+            self._mark_dirty_and_schedule_validation(immediate=True)
 
         def _next_binding_logical_channel(self) -> int:
             existing_channels = {
@@ -2443,6 +2963,8 @@ def build_main_window(app_logic: ReplayApplication):
             if index is None:
                 return
             self._refresh_binding_list(select_index=index)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation()
 
@@ -2465,6 +2987,8 @@ def build_main_window(app_logic: ReplayApplication):
             payload["source_bus_type"] = ""
             self._draft_bindings[index] = self._coerce_binding_draft(payload)
             self._refresh_binding_list(select_index=index)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation()
 
@@ -2481,6 +3005,8 @@ def build_main_window(app_logic: ReplayApplication):
             payload["source_bus_type"] = _display_text(source_summary.get("bus_type", "")).strip().upper()
             self._draft_bindings[index] = self._coerce_binding_draft(payload)
             self._refresh_binding_list(select_index=index)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation()
 
@@ -2505,6 +3031,8 @@ def build_main_window(app_logic: ReplayApplication):
             self.binding_sdk_root_edit.setText(_display_text(payload.get("sdk_root", "")))
             self._suspend_updates = False
             self._refresh_binding_list(select_index=index)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation()
 
@@ -2537,6 +3065,7 @@ def build_main_window(app_logic: ReplayApplication):
                 return
             index = self.binding_list.currentRow()
             self.remove_binding_button.setEnabled(index >= 0)
+            self._refresh_database_binding_statuses()
             self._load_selected_binding_into_editor(index)
             self._apply_validation_visuals()
 
@@ -2555,6 +3084,7 @@ def build_main_window(app_logic: ReplayApplication):
                         widget.setChecked(False)
                     else:
                         widget.clear()
+                self._refresh_binding_database_editor(None)
                 self._suspend_updates = False
                 return
 
@@ -2586,13 +3116,19 @@ def build_main_window(app_logic: ReplayApplication):
             self.binding_metadata_editor.setPlainText(_display_text(payload.get("metadata", "{}")))
             self._sync_text_edit_height(self.binding_network_editor, min_lines=4)
             self._sync_text_edit_height(self.binding_metadata_editor, min_lines=4)
+            self._refresh_binding_database_editor(_parse_optional_int_text(payload.get("logical_channel")))
             self._suspend_updates = False
 
         def _set_binding_editor_enabled(self, enabled: bool) -> None:
             for widget in self._binding_field_widgets.values():
                 widget.setEnabled(enabled)
-            self.binding_logical_channel_edit.setEnabled(False)
             self.binding_bus_type_edit.setEnabled(False)
+            self.binding_database_channel_edit.setEnabled(False)
+            self.binding_database_format_edit.setEnabled(False)
+            if not enabled:
+                self.binding_database_path_edit.setEnabled(False)
+                self.binding_database_browse_button.setEnabled(False)
+                self.binding_database_clear_button.setEnabled(False)
 
         def _add_binding(self) -> None:
             trace_id = self._next_unmapped_trace_id()
@@ -2603,7 +3139,10 @@ def build_main_window(app_logic: ReplayApplication):
             draft["trace_file_id"] = trace_id
             draft = self._coerce_binding_draft(draft)
             self._draft_bindings.append(draft)
+            self._refresh_database_binding_statuses()
             self._refresh_binding_list(select_index=len(self._draft_bindings) - 1)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation(immediate=True)
 
@@ -2611,9 +3150,14 @@ def build_main_window(app_logic: ReplayApplication):
             index = self.binding_list.currentRow()
             if index < 0:
                 return
+            logical_channel = _parse_optional_int_text(self._draft_bindings[index].get("logical_channel"))
             del self._draft_bindings[index]
+            self._prune_database_binding_for_channel_if_unused(logical_channel)
+            self._refresh_database_binding_statuses()
             next_index = min(index, len(self._draft_bindings) - 1)
             self._refresh_binding_list(select_index=next_index if next_index >= 0 else None)
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._refresh_all_collection_lists()
             self._mark_dirty_and_schedule_validation(immediate=True)
 
@@ -2629,7 +3173,13 @@ def build_main_window(app_logic: ReplayApplication):
             self.binding_list.clear()
             trace_lookup = self._binding_trace_lookup()
             for index, payload in enumerate(self._draft_bindings):
-                summary = _binding_summary(payload, trace_lookup)
+                logical_channel = _parse_optional_int_text(payload.get("logical_channel"))
+                summary = _resource_mapping_summary(
+                    payload,
+                    trace_lookup,
+                    database_binding=self._database_binding_for_channel(logical_channel),
+                    database_status=self._database_binding_statuses.get(int(logical_channel)) if logical_channel is not None else None,
+                )
                 error_count = self._binding_error_counts.get(index, 0)
                 if error_count:
                     summary = f"{summary} • {error_count} 个错误"
@@ -2778,6 +3328,7 @@ def build_main_window(app_logic: ReplayApplication):
             issues: list[ValidationIssue] = []
             warnings: list[ValidationIssue] = []
             normalized_bindings: list[tuple[int, dict]] = []
+            normalized_database_bindings: list[dict] = []
             for index, item in enumerate(self._draft_bindings):
                 normalized_item, item_issues = _validate_binding_draft(item, index)
                 if item_issues:
@@ -2805,6 +3356,14 @@ def build_main_window(app_logic: ReplayApplication):
                         normalized_collections[key].append(collection_normalizers[key](item, path_prefix=f"{key}[{index}]"))
                     except FieldValidationError as exc:
                         issues.append(ValidationIssue(key, exc.path, str(exc)))
+
+            for index, item in enumerate(self._database_binding_items()):
+                try:
+                    normalized_database_bindings.append(
+                        _normalize_database_binding_item(item, path_prefix=f"database_bindings[{index}]")
+                    )
+                except FieldValidationError as exc:
+                    issues.append(ValidationIssue("bindings", exc.path, str(exc)))
 
             try:
                 metadata = _parse_json_object_text(self.metadata_editor.toPlainText(), "场景元数据")
@@ -2885,6 +3444,28 @@ def build_main_window(app_logic: ReplayApplication):
                 if warning is not None:
                     warnings.append(warning)
 
+            for logical_channel, duplicate_count in sorted(self._database_binding_duplicate_counts.items()):
+                warnings.append(
+                    ValidationIssue(
+                        "bindings",
+                        f"database_bindings[{logical_channel}]",
+                        f"LC{logical_channel} 存在 {duplicate_count} 条DBC绑定，编辑器已按最后一条展示，保存时会去重。",
+                    )
+                )
+
+            orphan_database_bindings = _database_binding_orphan_items(
+                self._database_binding_drafts,
+                [binding for _, binding in normalized_bindings],
+            )
+            if orphan_database_bindings:
+                warnings.append(
+                    ValidationIssue(
+                        "bindings",
+                        "database_bindings",
+                        f"当前存在 {len(orphan_database_bindings)} 条孤立DBC绑定，默认保留，可在资源映射区单独移除。",
+                    )
+                )
+
             if has_file_mapping:
                 missing_mapped_trace_ids = sorted(set(trace_ids) - file_mapped_trace_ids)
                 if missing_mapped_trace_ids:
@@ -2901,7 +3482,7 @@ def build_main_window(app_logic: ReplayApplication):
                 "name": self.scenario_name_edit.text().strip() or "新场景",
                 "trace_file_ids": trace_ids,
                 "bindings": bindings,
-                "database_bindings": normalized_collections["database_bindings"],
+                "database_bindings": normalized_database_bindings,
                 "signal_overrides": normalized_collections["signal_overrides"],
                 "diagnostic_targets": normalized_collections["diagnostic_targets"],
                 "diagnostic_actions": normalized_collections["diagnostic_actions"],
@@ -2945,6 +3526,9 @@ def build_main_window(app_logic: ReplayApplication):
             return result
 
         def _validate_scenario(self) -> None:
+            self._refresh_database_binding_statuses()
+            self._refresh_binding_list(select_index=self.binding_list.currentRow(), reload_editor=False)
+            self._refresh_orphan_database_bindings()
             result = self._run_live_validation(
                 focus_first_error=True,
                 failure_message="校验失败，已定位到第一个错误。",
@@ -2960,6 +3544,9 @@ def build_main_window(app_logic: ReplayApplication):
             self._apply_validation_visuals()
 
         def _save_scenario(self) -> None:
+            self._refresh_database_binding_statuses()
+            self._refresh_binding_list(select_index=self.binding_list.currentRow(), reload_editor=False)
+            self._refresh_orphan_database_bindings()
             result = self._run_live_validation(
                 focus_first_error=True,
                 failure_message="保存前校验失败，请先修正错误。",
@@ -3023,7 +3610,8 @@ def build_main_window(app_logic: ReplayApplication):
             self._binding_list_error_messages = {}
             section_error_counts = {key: 0 for key in self._section_boxes}
             for issue in self._validation_errors:
-                section_error_counts[issue.section] = section_error_counts.get(issue.section, 0) + 1
+                section_key = "resources" if issue.section in {"traces", "bindings"} else issue.section
+                section_error_counts[section_key] = section_error_counts.get(section_key, 0) + 1
                 if issue.path in self._field_widgets:
                     self._set_field_error(issue.path, issue.message)
                     continue
@@ -3042,7 +3630,8 @@ def build_main_window(app_logic: ReplayApplication):
             trace_warning_messages = [warning.message for warning in self._validation_warnings if warning.section == "traces"]
             binding_warning_messages = [warning.message for warning in self._validation_warnings if warning.section == "bindings"]
             for warning in self._validation_warnings:
-                warning_counts[warning.section] = warning_counts.get(warning.section, 0) + 1
+                section_key = "resources" if warning.section in {"traces", "bindings"} else warning.section
+                warning_counts[section_key] = warning_counts.get(section_key, 0) + 1
             if trace_warning_messages:
                 self.trace_warning_label.setText("\n".join(trace_warning_messages))
                 self.trace_warning_label.setProperty("tone", "warn")
@@ -3064,6 +3653,8 @@ def build_main_window(app_logic: ReplayApplication):
                 select_index=self.binding_list.currentRow(),
                 reload_editor=False,
             )
+            self._refresh_trace_choice_labels()
+            self._refresh_orphan_database_bindings()
             self._update_section_titles(section_error_counts, warning_counts)
             self._update_status_labels()
 

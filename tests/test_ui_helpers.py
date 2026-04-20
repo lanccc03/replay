@@ -8,6 +8,7 @@ from replay_platform.ui.main_window import (
     _assess_scenario_launch,
     _binding_device_type_options,
     _binding_device_type_warning,
+    _build_orphan_database_binding_text,
     _build_override_catalog_status_text,
     _build_log_level_hint,
     _format_replay_stats,
@@ -25,6 +26,9 @@ from replay_platform.ui.main_window import (
     _build_scenario_selection_summary,
     _build_trace_delete_summary,
     _build_trace_selection_summary,
+    _database_binding_items_from_map,
+    _database_binding_map_from_items,
+    _database_binding_orphan_items,
     _filter_scenarios,
     _filter_trace_records,
     _parse_bool_text,
@@ -40,8 +44,10 @@ from replay_platform.ui.main_window import (
     _parse_log_level_option,
     _normalize_binding_item,
     _new_binding_draft,
+    _resource_mapping_summary,
     _scenario_payload_is_dirty,
     _should_reset_current_scenario_after_delete,
+    _trace_mapping_completion_text,
     _validate_binding_draft,
 )
 from replay_platform.app_controller import LOG_LEVEL_PRESET_DEBUG_ALL, LOG_LEVEL_PRESET_DEBUG_SAMPLED
@@ -402,6 +408,86 @@ class MainWindowHelperTests(unittest.TestCase):
             "can.asc | CH0 | CANFD -> zlg0/PC1 | zlg | CANFD/USBCANFD",
             _binding_summary(binding_payload, trace_lookup),
         )
+
+    def test_resource_mapping_summary_includes_dbc_state(self) -> None:
+        binding_payload = {
+            "trace_file_id": "trace-a",
+            "source_channel": 0,
+            "source_bus_type": "CANFD",
+            "adapter_id": "mock0",
+            "driver": "mock",
+            "logical_channel": "3",
+            "physical_channel": "9",
+            "bus_type": "CANFD",
+            "device_type": "MOCK",
+        }
+        trace_lookup = {
+            "trace-a": TraceFileRecord(
+                trace_id="trace-a",
+                name="body.asc",
+                original_path="/tmp/body.asc",
+                library_path="/tmp/cache.asc",
+                format="asc",
+                imported_at="now",
+            )
+        }
+
+        summary = _resource_mapping_summary(
+            binding_payload,
+            trace_lookup,
+            database_binding={"logical_channel": 3, "path": "/tmp/vehicle.dbc", "format": "dbc"},
+            database_status={"loaded": True, "message_count": 12},
+        )
+
+        self.assertIn("body.asc | CH0 | CANFD", summary)
+        self.assertIn("LC3", summary)
+        self.assertIn("mock0/PC9", summary)
+        self.assertIn("vehicle.dbc", summary)
+
+    def test_trace_mapping_completion_text_counts_mapped_sources(self) -> None:
+        bindings = [
+            {"trace_file_id": "trace-a", "logical_channel": 0},
+            {"trace_file_id": "trace-a", "logical_channel": 1},
+            {"trace_file_id": "trace-b", "logical_channel": 2},
+        ]
+
+        self.assertEqual("已映射 2 条源项", _trace_mapping_completion_text("trace-a", bindings))
+        self.assertEqual("未映射", _trace_mapping_completion_text("trace-c", bindings))
+
+    def test_database_binding_map_round_trip_deduplicates_by_channel(self) -> None:
+        binding_map, duplicate_counts = _database_binding_map_from_items(
+            [
+                {"logical_channel": 1, "path": "/tmp/old.dbc", "format": "dbc"},
+                {"logical_channel": 2, "path": "/tmp/body.dbc", "format": "dbc"},
+                {"logical_channel": 1, "path": "/tmp/new.dbc", "format": "dbc"},
+                {"logical_channel": "", "path": "/tmp/ignored.dbc", "format": "dbc"},
+            ]
+        )
+
+        self.assertEqual("/tmp/new.dbc", binding_map[1]["path"])
+        self.assertEqual("/tmp/body.dbc", binding_map[2]["path"])
+        self.assertEqual({1: 2}, duplicate_counts)
+        self.assertEqual(
+            [
+                {"logical_channel": 1, "path": "/tmp/new.dbc", "format": "dbc"},
+                {"logical_channel": 2, "path": "/tmp/body.dbc", "format": "dbc"},
+            ],
+            _database_binding_items_from_map(binding_map),
+        )
+
+    def test_database_binding_orphan_helpers_report_unreferenced_channels(self) -> None:
+        binding_map = {
+            0: {"logical_channel": 0, "path": "/tmp/used.dbc", "format": "dbc"},
+            2: {"logical_channel": 2, "path": "/tmp/orphan.dbc", "format": "dbc"},
+        }
+        bindings = [{"logical_channel": 0, "trace_file_id": "trace-a"}]
+
+        orphan_items = _database_binding_orphan_items(binding_map, bindings)
+
+        self.assertEqual([{"logical_channel": 2, "path": "/tmp/orphan.dbc", "format": "dbc"}], orphan_items)
+        orphan_text = _build_orphan_database_binding_text(orphan_items)
+        self.assertIn("orphan.dbc", orphan_text)
+        self.assertIn("LC2", orphan_text)
 
     def test_frame_enable_rule_summary_formats_compact_label(self) -> None:
         rule = FrameEnableRule(logical_channel=1, message_id=0x123, enabled=False)
