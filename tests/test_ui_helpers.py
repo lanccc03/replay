@@ -8,12 +8,15 @@ from replay_platform.ui.main_window import (
     _assess_scenario_launch,
     _binding_device_type_options,
     _binding_device_type_warning,
+    _build_override_catalog_status_text,
     _build_log_level_hint,
     _format_replay_stats,
     _binding_draft_from_item,
     _build_frame_enable_candidate_ids_from_trace_summaries,
+    _build_signal_catalog_hint,
     _binding_summary,
     _frame_enable_rule_summary,
+    _format_override_message_option,
     _build_scenario_delete_summary,
     _build_runtime_visibility_summary,
     _build_scenario_business_summary,
@@ -29,9 +32,11 @@ from replay_platform.ui.main_window import (
     _parse_int_text,
     _parse_json_object_text,
     _parse_scalar_text,
+    _signal_override_payload_items,
     _playback_button_state,
     _plan_log_refresh,
     _log_level_option,
+    _parse_message_combo_text,
     _parse_log_level_option,
     _normalize_binding_item,
     _new_binding_draft,
@@ -48,9 +53,11 @@ from replay_platform.core import (
     ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
+    SignalOverride,
     TimelineKind,
     TraceFileRecord,
 )
+from replay_platform.services.signal_catalog import MessageCatalogEntry, SignalCatalogEntry
 
 
 class MainWindowHelperTests(unittest.TestCase):
@@ -108,6 +115,17 @@ class MainWindowHelperTests(unittest.TestCase):
     def test_parse_hex_bytes_normalizes_spacing(self) -> None:
         self.assertEqual(_parse_hex_bytes_text("10 03", "payload"), "1003")
         self.assertEqual(_parse_hex_bytes_text("", "payload"), "")
+
+    def test_parse_message_combo_text_supports_named_options(self) -> None:
+        self.assertEqual(0x123, _parse_message_combo_text("0x123 | VehicleStatus"))
+        self.assertEqual(0x123, _parse_message_combo_text("0x123"))
+        self.assertIsNone(_parse_message_combo_text("VehicleStatus"))
+
+    def test_format_override_message_option_uses_message_name(self) -> None:
+        self.assertEqual(
+            "0x123 | VehicleStatus",
+            _format_override_message_option(MessageCatalogEntry(message_id=0x123, message_name="VehicleStatus")),
+        )
 
     def test_plan_log_refresh_requests_reset_when_cursor_falls_behind_buffer(self) -> None:
         self.assertEqual(("reset", 0), _plan_log_refresh(4, 5, 2000))
@@ -605,6 +623,94 @@ class MainWindowHelperTests(unittest.TestCase):
         self.assertEqual("回放文件：can.asc，缺失文件（trace-missing）", summary.trace_text)
         self.assertEqual("通道绑定：LC0（旧映射） -> mock0/PC1 CANFD", summary.binding_text)
         self.assertEqual("数据库绑定：LC0（旧映射） -> vehicle.dbc", summary.database_text)
+
+    def test_build_scenario_business_summary_includes_database_load_status(self) -> None:
+        payload = {
+            "scenario_id": "scenario-1",
+            "name": "示例场景",
+            "trace_file_ids": [],
+            "bindings": [
+                {
+                    "adapter_id": "mock0",
+                    "driver": "mock",
+                    "logical_channel": 0,
+                    "physical_channel": 1,
+                    "bus_type": "CANFD",
+                    "device_type": "MOCK",
+                }
+            ],
+            "database_bindings": [{"logical_channel": 0, "path": "/tmp/vehicle.dbc", "format": "dbc"}],
+            "signal_overrides": [],
+            "diagnostic_targets": [],
+            "diagnostic_actions": [],
+            "link_actions": [],
+            "metadata": {},
+        }
+
+        summary = _build_scenario_business_summary(
+            payload,
+            {},
+            {0: {"loaded": False, "error": "cantools missing", "message_count": 0}},
+        )
+
+        self.assertEqual("数据库绑定：LC0（旧映射） -> vehicle.dbc（加载失败：cantools missing）", summary.database_text)
+
+    def test_build_override_catalog_status_text_lists_loaded_and_failed_channels(self) -> None:
+        text = _build_override_catalog_status_text(
+            {
+                0: {"loaded": True, "message_count": 2},
+                1: {"loaded": False, "error": "missing.dbc"},
+            }
+        )
+
+        self.assertIn("已加载 2 个报文", text)
+        self.assertIn("加载失败：missing.dbc", text)
+
+    def test_build_signal_catalog_hint_includes_metadata(self) -> None:
+        text = _build_signal_catalog_hint(
+            SignalCatalogEntry(
+                message_id=0x200,
+                signal_name="LightState",
+                unit="",
+                minimum=0,
+                maximum=3,
+                choices={0: "Off", 1: "LowBeam"},
+            )
+        )
+
+        self.assertIn("LightState", text)
+        self.assertIn("范围 0 ~ 3", text)
+        self.assertIn("枚举 0=Off, 1=LowBeam", text)
+
+    def test_signal_override_payload_items_round_trip_with_scenario_spec(self) -> None:
+        payload_items = _signal_override_payload_items(
+            [
+                SignalOverride(
+                    logical_channel=0,
+                    message_id_or_pgn=0x123,
+                    signal_name="VehicleSpeed",
+                    value=42,
+                )
+            ]
+        )
+
+        scenario = ScenarioSpec.from_dict(
+            {
+                "scenario_id": "scenario-1",
+                "name": "写回验证",
+                "trace_file_ids": [],
+                "bindings": [],
+                "database_bindings": [],
+                "signal_overrides": payload_items,
+                "diagnostic_targets": [],
+                "diagnostic_actions": [],
+                "link_actions": [],
+                "metadata": {},
+            }
+        )
+
+        self.assertEqual(1, len(scenario.signal_overrides))
+        self.assertEqual("VehicleSpeed", scenario.signal_overrides[0].signal_name)
 
     def test_filter_helpers_use_case_insensitive_contains(self) -> None:
         traces = [

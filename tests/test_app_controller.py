@@ -18,6 +18,7 @@ from replay_platform.app_controller import (
 )
 from replay_platform.core import (
     BusType,
+    DatabaseBinding,
     DeviceChannelBinding,
     FrameEnableRule,
     FrameEvent,
@@ -28,6 +29,7 @@ from replay_platform.core import (
     ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
+    SignalOverride,
     TraceFileRecord,
 )
 from replay_platform.ui.main_window import _plan_log_refresh
@@ -53,6 +55,10 @@ class CompletedReplayEngineStub:
 
 
 class ReplayApplicationLogTests(unittest.TestCase):
+    @staticmethod
+    def _fixture_path(name: str) -> str:
+        return str(Path(__file__).resolve().parent / "fixtures" / name)
+
     def test_log_buffer_keeps_recent_entries_and_cursor_continues_after_trim(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             app = ReplayApplication(Path(workspace))
@@ -287,6 +293,201 @@ class ReplayApplicationLogTests(unittest.TestCase):
                 loop_enabled=True,
             )
             start.assert_called_once_with()
+
+    def test_start_prepared_replay_applies_workspace_overrides_after_scenario_defaults(self) -> None:
+        try:
+            import cantools  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cantools 未安装，跳过真实 DBC 解析测试")
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-prepare-dbc",
+                name="准备启动 DBC",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+                database_bindings=[
+                    DatabaseBinding(logical_channel=0, path=self._fixture_path("sample_vehicle.dbc"), format="dbc")
+                ],
+                signal_overrides=[
+                    SignalOverride(
+                        logical_channel=0,
+                        message_id_or_pgn=0x123,
+                        signal_name="VehicleSpeed",
+                        value=10,
+                    )
+                ],
+            )
+            app.replace_workspace_signal_overrides(
+                [
+                    SignalOverride(
+                        logical_channel=0,
+                        message_id_or_pgn=0x123,
+                        signal_name="VehicleSpeed",
+                        value=88,
+                    )
+                ]
+            )
+            preparation = ReplayPreparation(scenario=scenario, frames=[], launch_source=ReplayLaunchSource.SCENARIO_BOUND)
+
+            with patch.object(app, "_build_adapters", return_value={"mock0": object()}), patch.object(
+                app,
+                "_build_diagnostics",
+                return_value={},
+            ), patch.object(app.engine, "configure"), patch.object(app.engine, "start"):
+                app.start_prepared_replay(preparation)
+
+            overrides = app.engine.signal_overrides.list_overrides()
+            self.assertEqual(1, len(overrides))
+            self.assertEqual(88, overrides[0].value)
+
+    def test_start_prepared_replay_clears_previous_runtime_databases_and_overrides(self) -> None:
+        try:
+            import cantools  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cantools 未安装，跳过真实 DBC 解析测试")
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario_with_dbc = ScenarioSpec(
+                scenario_id="scenario-has-dbc",
+                name="Has DBC",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+                database_bindings=[
+                    DatabaseBinding(logical_channel=0, path=self._fixture_path("sample_vehicle.dbc"), format="dbc")
+                ],
+                signal_overrides=[
+                    SignalOverride(
+                        logical_channel=0,
+                        message_id_or_pgn=0x123,
+                        signal_name="Gear",
+                        value=3,
+                    )
+                ],
+            )
+            scenario_without_dbc = ScenarioSpec(
+                scenario_id="scenario-no-dbc",
+                name="No DBC",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+            )
+            preparation_with_dbc = ReplayPreparation(
+                scenario=scenario_with_dbc,
+                frames=[],
+                launch_source=ReplayLaunchSource.SCENARIO_BOUND,
+            )
+            preparation_without_dbc = ReplayPreparation(
+                scenario=scenario_without_dbc,
+                frames=[],
+                launch_source=ReplayLaunchSource.SCENARIO_BOUND,
+            )
+
+            with patch.object(app, "_build_adapters", return_value={"mock0": object()}), patch.object(
+                app,
+                "_build_diagnostics",
+                return_value={},
+            ), patch.object(app.engine, "configure"), patch.object(app.engine, "start"):
+                app.start_prepared_replay(preparation_with_dbc)
+                app.start_prepared_replay(preparation_without_dbc)
+
+            self.assertEqual([], app.engine.signal_overrides.list_overrides())
+            self.assertEqual([], app.engine.signal_overrides.list_message_ids(0))
+
+    def test_start_prepared_replay_allows_failed_database_binding_when_no_override_depends_on_it(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-warn-dbc",
+                name="Warn DBC",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+                database_bindings=[
+                    DatabaseBinding(logical_channel=0, path=str(Path(workspace) / "missing.dbc"), format="dbc")
+                ],
+            )
+            preparation = ReplayPreparation(scenario=scenario, frames=[], launch_source=ReplayLaunchSource.SCENARIO_BOUND)
+
+            with patch.object(app, "_build_adapters", return_value={"mock0": object()}), patch.object(
+                app,
+                "_build_diagnostics",
+                return_value={},
+            ), patch.object(app.engine, "configure"), patch.object(app.engine, "start"):
+                app.start_prepared_replay(preparation)
+
+            _, logs = app.log_snapshot()
+            self.assertTrue(any("数据库绑定加载失败" in entry for entry in logs))
+
+    def test_start_prepared_replay_blocks_when_workspace_override_depends_on_failed_database(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            app = ReplayApplication(Path(workspace))
+            scenario = ScenarioSpec(
+                scenario_id="scenario-fail-dbc",
+                name="Fail DBC",
+                bindings=[
+                    DeviceChannelBinding(
+                        adapter_id="mock0",
+                        driver="mock",
+                        logical_channel=0,
+                        physical_channel=0,
+                        bus_type=BusType.CAN,
+                        device_type="MOCK",
+                    )
+                ],
+                database_bindings=[
+                    DatabaseBinding(logical_channel=0, path=str(Path(workspace) / "missing.dbc"), format="dbc")
+                ],
+            )
+            app.replace_workspace_signal_overrides(
+                [
+                    SignalOverride(
+                        logical_channel=0,
+                        message_id_or_pgn=0x123,
+                        signal_name="VehicleSpeed",
+                        value=50,
+                    )
+                ]
+            )
+            preparation = ReplayPreparation(scenario=scenario, frames=[], launch_source=ReplayLaunchSource.SCENARIO_BOUND)
+
+            with patch.object(app, "_build_adapters", return_value={"mock0": object()}), patch.object(
+                app,
+                "_build_diagnostics",
+                return_value={},
+            ), patch.object(app.engine, "configure"), patch.object(app.engine, "start"):
+                with self.assertRaisesRegex(ValueError, "工作区覆盖"):
+                    app.start_prepared_replay(preparation)
 
     def test_stop_replay_clears_runtime_frame_enable_rules(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

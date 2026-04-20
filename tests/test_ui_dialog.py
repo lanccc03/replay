@@ -15,7 +15,7 @@ try:
     from replay_platform.app_controller import ReplayApplication
     from replay_platform.core import TraceFileRecord
     from replay_platform.ui.main_window import ScenarioEditorDialog, _new_binding_draft
-except ModuleNotFoundError:  # pragma: no cover - optional UI dependency in test env
+except (ModuleNotFoundError, ImportError):  # pragma: no cover - optional UI dependency in test env
     QApplication = None
     ReplayApplication = None
     TraceFileRecord = None
@@ -151,6 +151,47 @@ class ScenarioEditorDialogTests(unittest.TestCase):
                 self.assertEqual(first_summary, second_summary)
                 dialog.app_logic.list_traces.assert_not_called()
                 dialog.app_logic.get_trace_source_summaries.assert_called_once_with("trace-a")
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+
+    def test_replace_signal_overrides_updates_editor_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            dialog = ScenarioEditorDialog(
+                ReplayApplication(Path(workspace)),
+                trace_selection_supplier=lambda: [],
+                on_payload_changed=lambda _payload: None,
+                on_saved=lambda _payload: None,
+            )
+            try:
+                dialog.load_payload(
+                    {
+                        "scenario_id": "scenario-1",
+                        "name": "覆盖回填",
+                        "trace_file_ids": [],
+                        "bindings": [],
+                        "database_bindings": [],
+                        "signal_overrides": [],
+                        "diagnostic_targets": [],
+                        "diagnostic_actions": [],
+                        "link_actions": [],
+                        "metadata": {},
+                    }
+                )
+
+                dialog.replace_signal_overrides(
+                    [
+                        {
+                            "logical_channel": 0,
+                            "message_id_or_pgn": 0x123,
+                            "signal_name": "VehicleSpeed",
+                            "value": 66,
+                        }
+                    ]
+                )
+
+                self.assertEqual(1, len(dialog._collection_data["signal_overrides"]))
+                self.assertEqual("VehicleSpeed", dialog._collection_data["signal_overrides"][0]["signal_name"])
             finally:
                 dialog.close()
                 dialog.deleteLater()

@@ -18,6 +18,7 @@ from replay_platform.app_controller import (
 )
 from replay_platform.core import (
     BusType,
+    DatabaseBinding,
     DiagnosticTransport,
     FrameEnableRule,
     LinkActionType,
@@ -30,6 +31,7 @@ from replay_platform.core import (
     TimelineKind,
     TraceFileRecord,
 )
+from replay_platform.services.signal_catalog import MessageCatalogEntry, SignalCatalogEntry
 
 
 USER_ROLE = 32
@@ -494,6 +496,7 @@ def _trace_display_name(trace_id: str, trace_lookup: dict[str, TraceFileRecord])
 def _build_scenario_business_summary(
     payload: Optional[dict],
     trace_lookup: dict[str, TraceFileRecord],
+    database_status_by_channel: Optional[dict[int, dict[str, Any]]] = None,
 ) -> ScenarioBusinessSummary:
     if payload is None:
         return ScenarioBusinessSummary("回放文件：无", "通道绑定：无", "数据库绑定：无")
@@ -517,14 +520,19 @@ def _build_scenario_business_summary(
     else:
         binding_text = "通道绑定：未配置通道绑定"
 
-    database_map = {binding.logical_channel: Path(binding.path).name or binding.path for binding in scenario.database_bindings}
+    database_map = {binding.logical_channel: binding for binding in scenario.database_bindings}
     database_parts = [
-        f"{_logical_channel_label(binding.logical_channel, label_map)} -> {database_map.get(binding.logical_channel, '未配置数据库')}"
+        _database_binding_text(
+            binding.logical_channel,
+            database_map.get(binding.logical_channel),
+            label_map,
+            database_status_by_channel or {},
+        )
         for binding in scenario.bindings
     ]
     orphan_channels = sorted(set(database_map) - {binding.logical_channel for binding in scenario.bindings})
     database_parts.extend(
-        f"{_logical_channel_label(channel, label_map)} -> {database_map[channel]}"
+        _database_binding_text(channel, database_map[channel], label_map, database_status_by_channel or {})
         for channel in orphan_channels
     )
     if not database_parts:
@@ -532,6 +540,45 @@ def _build_scenario_business_summary(
     else:
         database_text = "数据库绑定：" + "；".join(database_parts)
     return ScenarioBusinessSummary(trace_text, binding_text, database_text)
+
+
+def _database_binding_text(
+    logical_channel: int,
+    binding: DatabaseBinding | None,
+    label_map: dict[int, str],
+    database_status_by_channel: dict[int, dict[str, Any]],
+) -> str:
+    channel_text = _logical_channel_label(logical_channel, label_map)
+    if binding is None:
+        return f"{channel_text} -> 未配置数据库"
+    path_text = Path(binding.path).name or binding.path
+    status = database_status_by_channel.get(logical_channel)
+    if not status:
+        return f"{channel_text} -> {path_text}"
+    if status.get("loaded"):
+        message_count = int(status.get("message_count", 0))
+        return f"{channel_text} -> {path_text}（已加载，{message_count} 个报文）"
+    error_text = _display_text(status.get("error", "")).strip() or "未知错误"
+    return f"{channel_text} -> {path_text}（加载失败：{error_text}）"
+
+
+def _build_override_catalog_status_text(
+    database_status_by_channel: dict[int, dict[str, Any]],
+    *,
+    label_map: Optional[dict[int, str]] = None,
+) -> str:
+    if not database_status_by_channel:
+        return "数据库状态：当前场景未配置数据库。"
+    parts: list[str] = []
+    resolved_label_map = label_map or {}
+    for logical_channel, status in sorted(database_status_by_channel.items()):
+        channel_text = _logical_channel_label(logical_channel, resolved_label_map)
+        if status.get("loaded"):
+            parts.append(f"{channel_text} 已加载 {int(status.get('message_count', 0))} 个报文")
+            continue
+        error_text = _display_text(status.get("error", "")).strip() or "未知错误"
+        parts.append(f"{channel_text} 加载失败：{error_text}")
+    return "数据库状态：" + "；".join(parts)
 
 
 def _filter_trace_records(records: list[TraceFileRecord], query: str) -> list[TraceFileRecord]:
@@ -841,6 +888,52 @@ def _signal_override_summary(item: dict, label_map: Optional[dict[int, str]] = N
     return f"{channel_text} | {message_id} | {signal_name} = {value}"
 
 
+def _format_override_message_option(entry: MessageCatalogEntry) -> str:
+    message_name = _display_text(entry.message_name).strip()
+    if not message_name:
+        return hex(entry.message_id)
+    return f"{hex(entry.message_id)} | {message_name}"
+
+
+def _parse_message_combo_text(raw: str) -> Optional[int]:
+    text = raw.strip()
+    if not text:
+        return None
+    candidate = text.split("|", 1)[0].strip()
+    try:
+        return int(candidate, 0)
+    except ValueError:
+        return None
+
+
+def _build_signal_catalog_hint(entry: Optional[SignalCatalogEntry]) -> str:
+    if entry is None:
+        return "信号说明：选择数据库信号后会显示单位、范围和枚举值。"
+    parts: list[str] = [f"信号说明：{entry.signal_name}"]
+    if entry.unit:
+        parts.append(f"单位 {entry.unit}")
+    if entry.minimum is not None or entry.maximum is not None:
+        minimum = _display_text(entry.minimum) if entry.minimum is not None else "-inf"
+        maximum = _display_text(entry.maximum) if entry.maximum is not None else "+inf"
+        parts.append(f"范围 {minimum} ~ {maximum}")
+    if entry.choices:
+        choice_text = ", ".join(f"{key}={value}" for key, value in sorted(entry.choices.items()))
+        parts.append(f"枚举 {choice_text}")
+    return " | ".join(parts)
+
+
+def _signal_override_payload_items(overrides: Sequence[SignalOverride]) -> list[dict]:
+    return [
+        {
+            "logical_channel": item.logical_channel,
+            "message_id_or_pgn": item.message_id_or_pgn,
+            "signal_name": item.signal_name,
+            "value": item.value,
+        }
+        for item in overrides
+    ]
+
+
 def _frame_enable_status_text(enabled: bool) -> str:
     return "启用" if enabled else "禁用"
 
@@ -1071,7 +1164,7 @@ def _normalize_signal_override_item(item: dict, *, path_prefix: str = "signal_ov
     try:
         return {
             "logical_channel": _parse_int_text(item.get("logical_channel", ""), "逻辑通道"),
-            "message_id_or_pgn": _parse_int_text(item.get("message_id_or_pgn", ""), "报文ID/PGN"),
+            "message_id_or_pgn": _parse_int_text(item.get("message_id_or_pgn", ""), "报文ID"),
             "signal_name": _require_text(item.get("signal_name", ""), "信号名"),
             "value": _parse_scalar_text(item.get("value", "")),
         }
@@ -1469,7 +1562,7 @@ def build_main_window(app_logic: ReplayApplication):
                 body_layout,
                 key="database_bindings",
                 title="数据库绑定",
-                hint="用数据库文件把逻辑通道映射到 DBC/J1939 DBC。",
+                hint="用数据库文件把逻辑通道映射到 CAN / CAN FD DBC。",
                 fields=[
                     EditorFieldSpec("logical_channel", "逻辑通道", "int"),
                     EditorFieldSpec("path", "文件路径"),
@@ -1486,7 +1579,7 @@ def build_main_window(app_logic: ReplayApplication):
                 hint="回放启动前先写入的信号默认值。",
                 fields=[
                     EditorFieldSpec("logical_channel", "逻辑通道", "int"),
-                    EditorFieldSpec("message_id_or_pgn", "报文ID/PGN", "hex-int"),
+                    EditorFieldSpec("message_id_or_pgn", "报文ID", "hex-int"),
                     EditorFieldSpec("signal_name", "信号名"),
                     EditorFieldSpec("value", "值", "scalar"),
                 ],
@@ -2617,6 +2710,11 @@ def build_main_window(app_logic: ReplayApplication):
             for key in self._collection_sections:
                 self._refresh_collection_list(key)
 
+        def replace_signal_overrides(self, overrides: Sequence[dict]) -> None:
+            self._collection_data["signal_overrides"] = [_clone_jsonable(item) for item in overrides]
+            self._refresh_collection_list("signal_overrides")
+            self._mark_dirty_and_schedule_validation(immediate=True)
+
         def _edit_selected_collection_item(self, key: str) -> None:
             index = self._collection_sections[key]["list"].currentRow()
             if index < 0:
@@ -3122,6 +3220,7 @@ def build_main_window(app_logic: ReplayApplication):
             self._scenario_editor: Optional[ScenarioEditorDialog] = None
             self._current_scenario_payload = ScenarioSpec.from_dict(self._default_scenario_payload()).to_dict()
             self._override_catalog_channels: set[int] = set()
+            self._override_catalog_statuses: dict[int, dict[str, Any]] = {}
             self._frame_enable_candidate_ids: dict[int, list[int]] = {}
             self._frame_enable_candidate_trace_ids: tuple[str, ...] = ()
             self._frame_enable_candidate_binding_signature: tuple[tuple[str, int, int, str], ...] = ()
@@ -3409,6 +3508,11 @@ def build_main_window(app_logic: ReplayApplication):
             hint.setProperty("role", "muted")
             layout.addWidget(hint)
 
+            self.override_catalog_status = QLabel("数据库状态：当前场景未配置数据库。")
+            self.override_catalog_status.setWordWrap(True)
+            self.override_catalog_status.setProperty("role", "muted")
+            layout.addWidget(self.override_catalog_status)
+
             form = QGridLayout()
             form.setHorizontalSpacing(12)
             form.setVerticalSpacing(10)
@@ -3435,19 +3539,34 @@ def build_main_window(app_logic: ReplayApplication):
             self.override_signal.lineEdit().setPlaceholderText("输入信号名，或选择数据库信号")
             form.addWidget(self.override_signal, 1, 1, 1, 3)
 
-            form.addWidget(QLabel("值"), 2, 0)
+            self.override_signal_hint = QLabel("信号说明：选择数据库信号后会显示单位、范围和枚举值。")
+            self.override_signal_hint.setWordWrap(True)
+            self.override_signal_hint.setProperty("role", "muted")
+            form.addWidget(self.override_signal_hint, 2, 0, 1, 4)
+
+            form.addWidget(QLabel("值"), 3, 0)
             self.override_value = QLineEdit()
             self.override_value.setPlaceholderText("输入覆盖值，例如 10、12.5 或 true")
             self.override_value.textChanged.connect(self._update_override_actions)
-            form.addWidget(self.override_value, 2, 1, 1, 2)
+            form.addWidget(self.override_value, 3, 1, 1, 2)
 
             self.override_apply = QPushButton("应用覆盖")
             self.override_apply.clicked.connect(self._apply_override)
             self._set_button_variant(self.override_apply, "secondary")
-            form.addWidget(self.override_apply, 2, 3)
+            form.addWidget(self.override_apply, 3, 3)
             layout.addLayout(form)
 
             action_row = QHBoxLayout()
+            self.load_scenario_overrides_button = QPushButton("载入场景初始覆盖")
+            self.load_scenario_overrides_button.clicked.connect(self._load_scenario_signal_overrides)
+            self._set_button_variant(self.load_scenario_overrides_button, "secondary")
+            action_row.addWidget(self.load_scenario_overrides_button)
+
+            self.write_back_overrides_button = QPushButton("写回当前场景")
+            self.write_back_overrides_button.clicked.connect(self._write_workspace_overrides_to_scenario)
+            self._set_button_variant(self.write_back_overrides_button, "secondary")
+            action_row.addWidget(self.write_back_overrides_button)
+
             action_row.addStretch(1)
             self.delete_override_button = QPushButton("删除选中覆盖")
             self.delete_override_button.clicked.connect(self._delete_selected_overrides)
@@ -3875,6 +3994,8 @@ def build_main_window(app_logic: ReplayApplication):
             self.override_signal.setEnabled(not replay_locked)
             self.override_value.setEnabled(not replay_locked)
             self.override_apply.setEnabled(not replay_locked)
+            self.load_scenario_overrides_button.setEnabled(not replay_locked)
+            self.write_back_overrides_button.setEnabled(not replay_locked)
             self.override_table.setEnabled(not replay_locked)
             self.delete_override_button.setEnabled(not replay_locked and bool(self.override_table.selectedIndexes()))
             self.clear_overrides_button.setEnabled(not replay_locked and self.override_table.rowCount() > 0)
@@ -3938,12 +4059,17 @@ def build_main_window(app_logic: ReplayApplication):
                     return
 
         def _set_current_scenario_payload(self, payload: dict) -> None:
+            previous_scenario_id = _display_text(self._current_scenario_payload.get("scenario_id", "")).strip()
             try:
                 normalized = ScenarioSpec.from_dict(payload).to_dict()
             except Exception:
                 normalized = _clone_jsonable(payload)
+            next_scenario_id = _display_text(normalized.get("scenario_id", "")).strip()
+            if previous_scenario_id and next_scenario_id != previous_scenario_id:
+                self.app_logic.clear_workspace_signal_overrides()
             self._current_scenario_payload = normalized
             self._sync_override_catalogs()
+            self._refresh_overrides()
             self._refresh_frame_enable_candidates()
             self._refresh_current_scenario_summary()
             self._refresh_runtime_state()
@@ -3986,20 +4112,20 @@ def build_main_window(app_logic: ReplayApplication):
             self.delete_scenario_button.setEnabled(not busy and has_selection)
 
         def _sync_override_catalogs(self) -> None:
-            loaded_channels: set[int] = set()
             try:
                 scenario = ScenarioSpec.from_dict(self._current_scenario_payload)
             except Exception:
                 self._override_catalog_channels = set()
+                self._override_catalog_statuses = {}
                 self._refresh_override_candidates()
                 return
-            for binding in scenario.database_bindings:
-                try:
-                    self.app_logic.signal_overrides.load_database(binding.logical_channel, binding.path)
-                except Exception:
-                    continue
-                loaded_channels.add(binding.logical_channel)
-            self._override_catalog_channels = loaded_channels
+            statuses = self.app_logic.rebuild_override_preview(scenario.database_bindings)
+            self._override_catalog_statuses = statuses
+            self._override_catalog_channels = {
+                logical_channel
+                for logical_channel, status in statuses.items()
+                if status.get("loaded")
+            }
             self._refresh_override_candidates()
 
         def _effective_frame_enable_trace_ids(self) -> tuple[str, ...]:
@@ -4062,7 +4188,11 @@ def build_main_window(app_logic: ReplayApplication):
         def _refresh_current_scenario_summary(self) -> None:
             payload = self._current_scenario_payload
             assessment = self._current_launch_assessment()
-            business = _build_scenario_business_summary(payload, self._trace_lookup)
+            business = _build_scenario_business_summary(
+                payload,
+                self._trace_lookup,
+                self._override_catalog_statuses,
+            )
             self.current_scenario_name.setText(payload.get("name", "未命名场景"))
             self.current_scenario_counts.setText(_build_scenario_counts_summary(payload))
             self.current_scenario_trace_text.setText(business.trace_text)
@@ -4223,7 +4353,7 @@ def build_main_window(app_logic: ReplayApplication):
                 for index in self.override_table.selectedIndexes()
                 if self.override_table.item(index.row(), 0) is not None
             }
-            overrides = self.app_logic.signal_overrides.list_overrides()
+            overrides = self.app_logic.list_workspace_signal_overrides()
             self.override_content_stack.setCurrentIndex(1 if overrides else 0)
             self.override_table.setRowCount(len(overrides))
             for row, override in enumerate(overrides):
@@ -4259,11 +4389,16 @@ def build_main_window(app_logic: ReplayApplication):
         def _refresh_override_candidates(self) -> None:
             self._refresh_override_message_options()
             self._refresh_override_signal_options()
+            self._refresh_override_catalog_status()
+            self._refresh_override_signal_hint()
             self._update_override_actions()
 
         def _refresh_override_message_options(self) -> None:
             current_text = self.override_message.currentText().strip()
-            items = [""] + [hex(message_id) for message_id in self._available_message_ids(self.override_channel.value())]
+            items = [""] + [
+                _format_override_message_option(entry)
+                for entry in self._available_messages(self.override_channel.value())
+            ]
             self.override_message.blockSignals(True)
             self.override_message.clear()
             self.override_message.addItems(items)
@@ -4284,29 +4419,52 @@ def build_main_window(app_logic: ReplayApplication):
             message_id = self._current_override_message_id()
             signal_names: list[str] = []
             if message_id is not None and self.override_channel.value() in self._override_catalog_channels:
-                signal_names = self.app_logic.signal_overrides.list_signal_names(self.override_channel.value(), message_id)
+                signal_names = [
+                    entry.signal_name
+                    for entry in self.app_logic.signal_overrides.list_signals(self.override_channel.value(), message_id)
+                ]
             self.override_signal.blockSignals(True)
             self.override_signal.clear()
             self.override_signal.addItems([""] + signal_names)
             self.override_signal.setCurrentText(current_text)
             self.override_signal.blockSignals(False)
+            self._refresh_override_signal_hint()
 
-        def _available_message_ids(self, logical_channel: int) -> list[int]:
+        def _refresh_override_catalog_status(self) -> None:
+            label_map = {}
+            try:
+                scenario = ScenarioSpec.from_dict(self._current_scenario_payload)
+            except Exception:
+                scenario = None
+            if scenario is not None:
+                label_map = _binding_label_map(scenario.bindings, self._trace_lookup)
+            self.override_catalog_status.setText(
+                _build_override_catalog_status_text(self._override_catalog_statuses, label_map=label_map)
+            )
+
+        def _refresh_override_signal_hint(self) -> None:
+            self.override_signal_hint.setText(_build_signal_catalog_hint(self._current_override_signal_entry()))
+
+        def _available_messages(self, logical_channel: int) -> list[MessageCatalogEntry]:
             if logical_channel not in self._override_catalog_channels:
                 return []
-            return self.app_logic.signal_overrides.list_message_ids(logical_channel)
+            return self.app_logic.signal_overrides.list_messages(logical_channel)
 
         def _available_frame_enable_message_ids(self, logical_channel: int) -> list[int]:
             return self._frame_enable_candidate_ids.get(logical_channel, [])
 
         def _current_override_message_id(self) -> Optional[int]:
-            text = self.override_message.currentText().strip()
-            if not text:
+            return _parse_message_combo_text(self.override_message.currentText())
+
+        def _current_override_signal_entry(self) -> Optional[SignalCatalogEntry]:
+            message_id = self._current_override_message_id()
+            if message_id is None or self.override_channel.value() not in self._override_catalog_channels:
                 return None
-            try:
-                return int(text, 0)
-            except ValueError:
-                return None
+            signal_name = self.override_signal.currentText().strip()
+            for entry in self.app_logic.signal_overrides.list_signals(self.override_channel.value(), message_id):
+                if entry.signal_name == signal_name:
+                    return entry
+            return None
 
         def _current_frame_enable_message_id(self) -> Optional[int]:
             text = self.frame_enable_message.currentText().strip()
@@ -4318,10 +4476,13 @@ def build_main_window(app_logic: ReplayApplication):
                 return None
 
         def _update_override_actions(self) -> None:
+            self._refresh_override_signal_hint()
             if self._replay_prepare_in_progress:
                 self.delete_override_button.setEnabled(False)
                 self.clear_overrides_button.setEnabled(False)
                 self.override_apply.setEnabled(False)
+                self.load_scenario_overrides_button.setEnabled(False)
+                self.write_back_overrides_button.setEnabled(False)
                 return
             has_selection = bool(self.override_table.selectedIndexes())
             has_rows = self.override_table.rowCount() > 0
@@ -4331,6 +4492,8 @@ def build_main_window(app_logic: ReplayApplication):
             self.delete_override_button.setEnabled(has_selection)
             self.clear_overrides_button.setEnabled(has_rows)
             self.override_apply.setEnabled(message_id is not None and bool(signal_name) and bool(value_text))
+            self.load_scenario_overrides_button.setEnabled(True)
+            self.write_back_overrides_button.setEnabled(has_rows)
 
         def _update_frame_enable_actions(self) -> None:
             if self._replay_prepare_in_progress:
@@ -4558,11 +4721,35 @@ def build_main_window(app_logic: ReplayApplication):
                     signal_name=signal_name,
                     value=value,
                 )
-                self.app_logic.signal_overrides.set_override(override)
+                self.app_logic.set_workspace_signal_override(override)
             except Exception as exc:
                 QMessageBox.critical(self, "信号覆盖失败", str(exc))
                 return
             self._refresh_overrides()
+            self._refresh_override_signal_hint()
+
+        def _load_scenario_signal_overrides(self) -> None:
+            try:
+                scenario = ScenarioSpec.from_dict(dict(self._current_scenario_payload))
+            except Exception as exc:
+                QMessageBox.critical(self, "载入失败", str(exc))
+                return
+            self.app_logic.replace_workspace_signal_overrides(scenario.signal_overrides)
+            self._refresh_overrides()
+
+        def _write_workspace_overrides_to_scenario(self) -> None:
+            try:
+                scenario = ScenarioSpec.from_dict(dict(self._current_scenario_payload))
+                self.app_logic.validate_workspace_signal_overrides(scenario.database_bindings)
+            except Exception as exc:
+                QMessageBox.critical(self, "写回失败", str(exc))
+                return
+            payload = _clone_jsonable(self._current_scenario_payload)
+            payload["signal_overrides"] = _signal_override_payload_items(self.app_logic.list_workspace_signal_overrides())
+            self._set_current_scenario_payload(payload)
+            if self._scenario_editor is not None and self._scenario_editor.isVisible():
+                self._scenario_editor.replace_signal_overrides(payload["signal_overrides"])
+            QMessageBox.information(self, "写回完成", "当前工作区覆盖已写回到当前场景草稿。")
 
         def _apply_frame_enable(self) -> None:
             try:
@@ -4592,7 +4779,7 @@ def build_main_window(app_logic: ReplayApplication):
                 key = item.data(USER_ROLE)
                 if not key:
                     continue
-                self.app_logic.signal_overrides.clear_override(*key)
+                self.app_logic.clear_workspace_signal_override(*key)
             self._refresh_overrides()
 
         def _delete_selected_frame_enables(self) -> None:
@@ -4615,7 +4802,7 @@ def build_main_window(app_logic: ReplayApplication):
             self._refresh_logs()
 
         def _clear_all_overrides(self) -> None:
-            self.app_logic.signal_overrides.clear_all()
+            self.app_logic.clear_workspace_signal_overrides()
             self._refresh_overrides()
 
         def _clear_all_frame_enables(self) -> None:

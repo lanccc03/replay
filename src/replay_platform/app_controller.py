@@ -16,6 +16,7 @@ from replay_platform.core import (
     AdapterCapabilities,
     BusType,
     ChannelDescriptor,
+    DatabaseBinding,
     DeviceChannelBinding,
     DiagnosticTransport,
     FrameEvent,
@@ -26,6 +27,7 @@ from replay_platform.core import (
     ReplayRuntimeSnapshot,
     ReplayState,
     ScenarioSpec,
+    SignalOverride,
     TraceFileRecord,
 )
 from replay_platform.services.frame_enable import FrameEnableService
@@ -85,10 +87,11 @@ class ReplayApplication:
         self.trace_loader = TraceLoader()
         self.library = FileLibraryService(self.paths, self.trace_loader)
         self.signal_overrides = SignalOverrideService()
+        self._runtime_signal_overrides = SignalOverrideService()
         self.frame_enables = FrameEnableService()
         self.log_config = log_config or ReplayLogConfig()
         self.engine = ReplayEngine(
-            signal_overrides=self.signal_overrides,
+            signal_overrides=self._runtime_signal_overrides,
             frame_enables=self.frame_enables,
             logger=self.log,
             log_config=self.log_config,
@@ -99,6 +102,8 @@ class ReplayApplication:
         self._last_runtime_state = ReplayState.STOPPED
         self._prepared_trace_cache: OrderedDict[PreparedTraceCacheKey, tuple[FrameEvent, ...]] = OrderedDict()
         self._prepared_trace_cache_lock = threading.Lock()
+        self._workspace_overrides: Dict[tuple[int, int, str], SignalOverride] = {}
+        self._workspace_override_lock = threading.Lock()
 
     def log(self, message: str) -> None:
         self._append_log(message)
@@ -206,6 +211,44 @@ class ReplayApplication:
     def save_scenario(self, scenario: ScenarioSpec) -> None:
         self.library.save_scenario(scenario)
 
+    def list_workspace_signal_overrides(self) -> List[SignalOverride]:
+        with self._workspace_override_lock:
+            return sorted(
+                self._workspace_overrides.values(),
+                key=lambda item: (item.logical_channel, item.message_id_or_pgn, item.signal_name),
+            )
+
+    def replace_workspace_signal_overrides(self, overrides: Sequence[SignalOverride]) -> None:
+        with self._workspace_override_lock:
+            self._workspace_overrides = {
+                (item.logical_channel, item.message_id_or_pgn, item.signal_name): item
+                for item in overrides
+            }
+
+    def set_workspace_signal_override(self, override: SignalOverride) -> None:
+        with self._workspace_override_lock:
+            self._workspace_overrides[(override.logical_channel, override.message_id_or_pgn, override.signal_name)] = override
+
+    def clear_workspace_signal_override(self, logical_channel: int, message_id_or_pgn: int, signal_name: str) -> None:
+        with self._workspace_override_lock:
+            self._workspace_overrides.pop((logical_channel, message_id_or_pgn, signal_name), None)
+
+    def clear_workspace_signal_overrides(self) -> None:
+        with self._workspace_override_lock:
+            self._workspace_overrides.clear()
+
+    def rebuild_override_preview(self, bindings: Sequence[DatabaseBinding]) -> dict[int, dict[str, Any]]:
+        return self._load_database_bindings(self.signal_overrides, bindings)
+
+    def validate_workspace_signal_overrides(self, bindings: Sequence[DatabaseBinding]) -> dict[int, dict[str, Any]]:
+        statuses = self.rebuild_override_preview(bindings)
+        self._validate_signal_overrides(
+            [("工作区覆盖", item) for item in self.list_workspace_signal_overrides()],
+            statuses,
+            self.signal_overrides,
+        )
+        return statuses
+
     def delete_trace(self, trace_id: str) -> DeleteTraceResult:
         result = self.library.delete_trace(trace_id)
         self._invalidate_prepared_trace_cache(trace_id)
@@ -256,10 +299,16 @@ class ReplayApplication:
     def start_prepared_replay(self, preparation: ReplayPreparation) -> None:
         scenario = preparation.scenario
         self.frame_enables.clear_all()
-        for binding in scenario.database_bindings:
-            self.signal_overrides.load_database(binding.logical_channel, binding.path)
+        runtime_statuses = self._load_database_bindings(self._runtime_signal_overrides, scenario.database_bindings)
+        self._log_database_binding_statuses(runtime_statuses)
+        override_items = [("场景初始覆盖", item) for item in scenario.signal_overrides]
+        override_items.extend(("工作区覆盖", item) for item in self.list_workspace_signal_overrides())
+        self._validate_signal_overrides(override_items, runtime_statuses, self._runtime_signal_overrides)
+        self._runtime_signal_overrides.clear_overrides()
         for override in scenario.signal_overrides:
-            self.signal_overrides.set_override(override)
+            self._runtime_signal_overrides.set_override(override)
+        for override in self.list_workspace_signal_overrides():
+            self._runtime_signal_overrides.set_override(override)
         adapters = self._build_adapters(scenario)
         diagnostics = self._build_diagnostics(scenario, adapters)
         self.engine.configure(
@@ -310,6 +359,86 @@ class ReplayApplication:
                     adapter.close()
                 except Exception:
                     pass
+
+    def _load_database_bindings(
+        self,
+        service: SignalOverrideService,
+        bindings: Sequence[DatabaseBinding],
+    ) -> dict[int, dict[str, Any]]:
+        service.clear_codecs()
+        statuses: dict[int, dict[str, Any]] = {}
+        for binding in bindings:
+            logical_channel = int(binding.logical_channel)
+            normalized_format = str(binding.format or "dbc")
+            service.clear_codec(logical_channel)
+            status = {
+                "logical_channel": logical_channel,
+                "path": binding.path,
+                "format": normalized_format,
+                "loaded": False,
+                "error": "",
+                "message_count": 0,
+            }
+            try:
+                service.load_database(logical_channel, binding.path, format=normalized_format)
+            except Exception as exc:
+                status["error"] = str(exc).strip() or exc.__class__.__name__
+            else:
+                status["loaded"] = True
+                status["message_count"] = len(service.list_messages(logical_channel))
+            statuses[logical_channel] = status
+        return statuses
+
+    def _validate_signal_overrides(
+        self,
+        overrides: Sequence[tuple[str, SignalOverride]],
+        statuses: dict[int, dict[str, Any]],
+        service: SignalOverrideService,
+    ) -> None:
+        errors: list[str] = []
+        for source_label, override in overrides:
+            logical_channel = int(override.logical_channel)
+            status = statuses.get(logical_channel)
+            if status is None:
+                errors.append(
+                    f"{source_label}：LC{logical_channel} 未配置数据库，无法校验报文 0x{override.message_id_or_pgn:X} / {override.signal_name}。"
+                )
+                continue
+            if not status.get("loaded"):
+                errors.append(
+                    (
+                        f"{source_label}：LC{logical_channel} 的数据库 {status.get('path', '')} 加载失败，"
+                        f"无法校验报文 0x{override.message_id_or_pgn:X} / {override.signal_name}。"
+                        f" 原因：{status.get('error', '未知错误')}"
+                    )
+                )
+                continue
+            if override.message_id_or_pgn not in service.list_message_ids(logical_channel):
+                errors.append(
+                    f"{source_label}：LC{logical_channel} 的数据库未找到报文 0x{override.message_id_or_pgn:X}。"
+                )
+                continue
+            signal_names = service.list_signal_names(logical_channel, override.message_id_or_pgn)
+            if override.signal_name not in signal_names:
+                errors.append(
+                    (
+                        f"{source_label}：LC{logical_channel} 报文 0x{override.message_id_or_pgn:X} "
+                        f"未找到信号 {override.signal_name}。"
+                    )
+                )
+        if errors:
+            raise ValueError("信号覆盖校验失败：\n" + "\n".join(errors))
+
+    def _log_database_binding_statuses(self, statuses: dict[int, dict[str, Any]]) -> None:
+        for logical_channel, status in sorted(statuses.items()):
+            if status.get("loaded"):
+                continue
+            self.log_warning(
+                (
+                    f"数据库绑定加载失败：LC{logical_channel} 路径={status.get('path', '')} "
+                    f"格式={status.get('format', '')} 原因={status.get('error', '未知错误')}"
+                )
+            )
 
     def _load_replay_frames(self, scenario: ScenarioSpec) -> List[FrameEvent]:
         trace_sequences: List[Sequence[FrameEvent]] = []

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -36,11 +36,34 @@ class MessageCodec(Protocol):
     def message_name(self, message_id: int) -> str:
         ...
 
+    def messages(self) -> List["MessageCatalogEntry"]:
+        ...
+
+    def signals(self, message_id: int) -> List["SignalCatalogEntry"]:
+        ...
+
 
 @dataclass
 class StaticMessageDefinition:
     name: str
     signal_bytes: Dict[str, int]
+    signal_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MessageCatalogEntry:
+    message_id: int
+    message_name: str
+
+
+@dataclass(frozen=True)
+class SignalCatalogEntry:
+    message_id: int
+    signal_name: str
+    unit: str = ""
+    minimum: Any = None
+    maximum: Any = None
+    choices: Dict[int, str] = field(default_factory=dict)
 
 
 class StaticMessageCodec:
@@ -80,6 +103,29 @@ class StaticMessageCodec:
     def message_name(self, message_id: int) -> str:
         return self.definitions[message_id].name
 
+    def messages(self) -> List[MessageCatalogEntry]:
+        return [
+            MessageCatalogEntry(message_id=message_id, message_name=self.definitions[message_id].name)
+            for message_id in self.message_ids()
+        ]
+
+    def signals(self, message_id: int) -> List[SignalCatalogEntry]:
+        definition = self.definitions[message_id]
+        entries: List[SignalCatalogEntry] = []
+        for signal_name in definition.signal_bytes:
+            metadata = dict(definition.signal_metadata.get(signal_name, {}))
+            entries.append(
+                SignalCatalogEntry(
+                    message_id=message_id,
+                    signal_name=signal_name,
+                    unit=str(metadata.get("unit", "") or ""),
+                    minimum=metadata.get("minimum"),
+                    maximum=metadata.get("maximum"),
+                    choices=_normalize_choices(metadata.get("choices")),
+                )
+            )
+        return entries
+
 
 class CantoolsSignalCatalog:
     def __init__(self, database: Any) -> None:
@@ -87,14 +133,15 @@ class CantoolsSignalCatalog:
         self._messages = {message.frame_id: message for message in database.messages}
 
     @classmethod
-    def from_file(cls, path: str) -> "CantoolsSignalCatalog":
+    def from_file(cls, path: str, *, format: str = "dbc") -> "CantoolsSignalCatalog":
+        normalized_format = _normalize_database_format(format)
         try:
             import cantools  # type: ignore
         except ModuleNotFoundError as exc:
             raise DependencyUnavailableError(
                 "加载 DBC/J1939 数据库需要安装 cantools。"
             ) from exc
-        database = cantools.database.load_file(path)
+        database = cantools.database.load_file(path, database_format=normalized_format)
         return cls(database)
 
     def supports(self, message_id: int) -> bool:
@@ -119,6 +166,26 @@ class CantoolsSignalCatalog:
     def message_name(self, message_id: int) -> str:
         return self._messages[message_id].name
 
+    def messages(self) -> List[MessageCatalogEntry]:
+        return [
+            MessageCatalogEntry(message_id=message_id, message_name=self._messages[message_id].name)
+            for message_id in self.message_ids()
+        ]
+
+    def signals(self, message_id: int) -> List[SignalCatalogEntry]:
+        message = self._messages[message_id]
+        return [
+            SignalCatalogEntry(
+                message_id=message_id,
+                signal_name=signal.name,
+                unit=str(getattr(signal, "unit", "") or ""),
+                minimum=getattr(signal, "minimum", None),
+                maximum=getattr(signal, "maximum", None),
+                choices=_normalize_choices(getattr(signal, "choices", None)),
+            )
+            for signal in message.signals
+        ]
+
 
 class SignalOverrideService:
     def __init__(self) -> None:
@@ -129,8 +196,15 @@ class SignalOverrideService:
     def bind_codec(self, logical_channel: int, codec: MessageCodec) -> None:
         self._codecs_by_channel[logical_channel] = codec
 
-    def load_database(self, logical_channel: int, path: str) -> None:
-        self.bind_codec(logical_channel, CantoolsSignalCatalog.from_file(path))
+    def clear_codec(self, logical_channel: int) -> None:
+        self._codecs_by_channel.pop(logical_channel, None)
+
+    def clear_codecs(self) -> None:
+        self._codecs_by_channel.clear()
+
+    def load_database(self, logical_channel: int, path: str, *, format: str = "dbc") -> None:
+        normalized_format = _normalize_database_format(format)
+        self.bind_codec(logical_channel, CantoolsSignalCatalog.from_file(path, format=normalized_format))
 
     def set_override(self, override: SignalOverride) -> None:
         key = (override.logical_channel, override.message_id_or_pgn, override.signal_name)
@@ -148,15 +222,30 @@ class SignalOverrideService:
         if not bucket:
             self._overrides_by_message.pop(bucket_key, None)
 
-    def clear_all(self) -> None:
+    def clear_overrides(self) -> None:
         self._overrides.clear()
         self._overrides_by_message.clear()
+
+    def clear_all(self) -> None:
+        self.clear_overrides()
 
     def list_overrides(self) -> List[SignalOverride]:
         return sorted(
             self._overrides.values(),
             key=lambda item: (item.logical_channel, item.message_id_or_pgn, item.signal_name),
         )
+
+    def list_messages(self, logical_channel: int) -> List[MessageCatalogEntry]:
+        codec = self._codecs_by_channel.get(logical_channel)
+        if codec is None:
+            return []
+        return codec.messages()
+
+    def list_signals(self, logical_channel: int, message_id: int) -> List[SignalCatalogEntry]:
+        codec = self._codecs_by_channel.get(logical_channel)
+        if codec is None or not codec.supports(message_id):
+            return []
+        return codec.signals(message_id)
 
     def available_aliases(self, logical_channel: int) -> Dict[str, str]:
         codec = self._codecs_by_channel.get(logical_channel)
@@ -211,3 +300,24 @@ class SignalOverrideService:
 
 def _normalize(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _normalize_database_format(format_name: str) -> str:
+    normalized = str(format_name or "dbc").strip().lower()
+    if normalized != "dbc":
+        raise ValueError(f"当前仅支持 dbc 数据库格式：{format_name}")
+    return normalized
+
+
+def _normalize_choices(raw_choices: Any) -> Dict[int, str]:
+    if not raw_choices or not isinstance(raw_choices, dict):
+        return {}
+    choices: Dict[int, str] = {}
+    for raw_key, raw_value in raw_choices.items():
+        try:
+            key = int(raw_key)
+        except (TypeError, ValueError):
+            continue
+        label = getattr(raw_value, "name", raw_value)
+        choices[key] = str(label)
+    return dict(sorted(choices.items()))
