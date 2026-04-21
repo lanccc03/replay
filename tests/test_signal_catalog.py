@@ -219,6 +219,38 @@ class SignalOverrideTests(unittest.TestCase):
         )
         self.assertEqual("VehicleStatus", service.message_name(0, 0x123))
 
+    def test_apply_real_dbc_override_preserves_undefined_bits(self):
+        try:
+            import cantools  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cantools 未安装，跳过真实 DBC 解析测试")
+        service = SignalOverrideService()
+        service.load_database(0, self._fixture_path("sample_vehicle.dbc"), format="dbc")
+        service.set_override(
+            SignalOverride(
+                logical_channel=0,
+                message_id_or_pgn=0x123,
+                signal_name="VehicleSpeed",
+                value=12.3,
+            )
+        )
+        original_payload = bytes.fromhex("64000AAA55CC33F0")
+        event = FrameEvent(
+            ts_ns=0,
+            bus_type=BusType.CAN,
+            channel=0,
+            message_id=0x123,
+            payload=original_payload,
+            dlc=8,
+        )
+
+        patched = service.apply(event)
+
+        self.assertEqual(bytes.fromhex("7B000AAA55CC33F0"), patched.payload)
+        self.assertEqual(original_payload[2:], patched.payload[2:])
+        self.assertNotEqual(bytes.fromhex("7B000AFFFFFFFFFF"), patched.payload)
+        self.assertNotEqual(bytes.fromhex("7B000A0000000000"), patched.payload)
+
     def test_load_database_rejects_unsupported_format(self):
         service = SignalOverrideService()
 

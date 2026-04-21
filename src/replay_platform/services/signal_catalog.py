@@ -158,7 +158,17 @@ class CantoolsSignalCatalog:
         message = self._messages[message_id]
         existing = dict(message.decode(base_payload, decode_choices=False, scaling=True))
         existing.update(values)
-        return bytes(message.encode(existing, scaling=True, padding=True))
+        message.assert_signals_encodable(existing, scaling=True)
+        codec = getattr(message, "_codecs", None)
+        if codec is None:
+            raise ValueError("Codec is not initialized.")
+        encoded, padding_mask, _ = message._encode(codec, existing, scaling=True)
+        base_value = int.from_bytes(base_payload, "big")
+        message_mask = (1 << (message.length * 8)) - 1
+        signal_mask = message_mask ^ padding_mask
+        # Keep raw undefined bits from the trace payload and only rewrite defined signal bits.
+        merged = (encoded & signal_mask) | (base_value & padding_mask)
+        return merged.to_bytes(message.length, "big")
 
     def signal_names(self, message_id: int) -> List[str]:
         return [signal.name for signal in self._messages[message_id].signals]
