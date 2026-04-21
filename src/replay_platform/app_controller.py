@@ -104,6 +104,7 @@ class ReplayApplication:
         self._prepared_trace_cache_lock = threading.Lock()
         self._workspace_overrides: Dict[tuple[int, int, str], SignalOverride] = {}
         self._workspace_override_lock = threading.Lock()
+        self._active_runtime_scenario: ScenarioSpec | None = None
 
     def log(self, message: str) -> None:
         self._append_log(message)
@@ -218,24 +219,44 @@ class ReplayApplication:
                 key=lambda item: (item.logical_channel, item.message_id_or_pgn, item.signal_name),
             )
 
-    def replace_workspace_signal_overrides(self, overrides: Sequence[SignalOverride]) -> None:
+    def replace_workspace_signal_overrides(
+        self,
+        overrides: Sequence[SignalOverride],
+        *,
+        sync_runtime: bool = False,
+    ) -> None:
         with self._workspace_override_lock:
             self._workspace_overrides = {
                 (item.logical_channel, item.message_id_or_pgn, item.signal_name): item
                 for item in overrides
             }
+        if sync_runtime:
+            self._sync_runtime_signal_overrides()
 
-    def set_workspace_signal_override(self, override: SignalOverride) -> None:
+    def set_workspace_signal_override(self, override: SignalOverride, *, sync_runtime: bool = False) -> None:
         with self._workspace_override_lock:
             self._workspace_overrides[(override.logical_channel, override.message_id_or_pgn, override.signal_name)] = override
+        if sync_runtime:
+            self._sync_runtime_signal_overrides()
 
-    def clear_workspace_signal_override(self, logical_channel: int, message_id_or_pgn: int, signal_name: str) -> None:
+    def clear_workspace_signal_override(
+        self,
+        logical_channel: int,
+        message_id_or_pgn: int,
+        signal_name: str,
+        *,
+        sync_runtime: bool = False,
+    ) -> None:
         with self._workspace_override_lock:
             self._workspace_overrides.pop((logical_channel, message_id_or_pgn, signal_name), None)
+        if sync_runtime:
+            self._sync_runtime_signal_overrides()
 
-    def clear_workspace_signal_overrides(self) -> None:
+    def clear_workspace_signal_overrides(self, *, sync_runtime: bool = False) -> None:
         with self._workspace_override_lock:
             self._workspace_overrides.clear()
+        if sync_runtime:
+            self._sync_runtime_signal_overrides()
 
     def rebuild_override_preview(self, bindings: Sequence[DatabaseBinding]) -> dict[int, dict[str, Any]]:
         return self._load_database_bindings(self.signal_overrides, bindings)
@@ -264,6 +285,7 @@ class ReplayApplication:
             snapshot = self.engine.snapshot()
         if snapshot.state == ReplayState.STOPPED and self._last_runtime_state != ReplayState.STOPPED:
             self.frame_enables.clear_all()
+            self._active_runtime_scenario = None
         self._last_runtime_state = snapshot.state
         return snapshot
 
@@ -304,11 +326,7 @@ class ReplayApplication:
         override_items = [("场景初始覆盖", item) for item in scenario.signal_overrides]
         override_items.extend(("工作区覆盖", item) for item in self.list_workspace_signal_overrides())
         self._validate_signal_overrides(override_items, runtime_statuses, self._runtime_signal_overrides)
-        self._runtime_signal_overrides.clear_overrides()
-        for override in scenario.signal_overrides:
-            self._runtime_signal_overrides.set_override(override)
-        for override in self.list_workspace_signal_overrides():
-            self._runtime_signal_overrides.set_override(override)
+        self._apply_runtime_signal_overrides(scenario)
         adapters = self._build_adapters(scenario)
         diagnostics = self._build_diagnostics(scenario, adapters)
         self.engine.configure(
@@ -320,11 +338,13 @@ class ReplayApplication:
             loop_enabled=preparation.loop_enabled,
         )
         self.engine.start()
+        self._active_runtime_scenario = scenario
         self._last_runtime_state = self.engine.state
 
     def stop_replay(self) -> None:
         self.engine.stop()
         self.frame_enables.clear_all()
+        self._active_runtime_scenario = None
         self._last_runtime_state = ReplayState.STOPPED
 
     def pause_replay(self) -> None:
@@ -332,6 +352,19 @@ class ReplayApplication:
 
     def resume_replay(self) -> None:
         self.engine.resume()
+
+    def _apply_runtime_signal_overrides(self, scenario: ScenarioSpec) -> None:
+        self._runtime_signal_overrides.clear_overrides()
+        for override in scenario.signal_overrides:
+            self._runtime_signal_overrides.set_override(override)
+        for override in self.list_workspace_signal_overrides():
+            self._runtime_signal_overrides.set_override(override)
+
+    def _sync_runtime_signal_overrides(self) -> None:
+        scenario = self._active_runtime_scenario
+        if scenario is None or self.engine.state == ReplayState.STOPPED:
+            return
+        self._apply_runtime_signal_overrides(scenario)
 
     def probe_binding_channels(self, binding: DeviceChannelBinding) -> dict[str, Any]:
         result: dict[str, Any] = {

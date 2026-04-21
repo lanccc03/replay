@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tests.bootstrap  # noqa: F401
@@ -32,6 +34,7 @@ from replay_platform.core import (
     SignalOverride,
     TraceFileRecord,
 )
+from replay_platform.services.signal_catalog import SignalOverrideService
 from replay_platform.ui.main_window import _plan_log_refresh
 
 
@@ -348,6 +351,99 @@ class ReplayApplicationLogTests(unittest.TestCase):
             overrides = app.engine.signal_overrides.list_overrides()
             self.assertEqual(1, len(overrides))
             self.assertEqual(88, overrides[0].value)
+
+    def _make_runtime_override_app(self, scenario: ScenarioSpec) -> ReplayApplication:
+        app = ReplayApplication.__new__(ReplayApplication)
+        runtime_signal_overrides = SignalOverrideService()
+        app.signal_overrides = SignalOverrideService()
+        app._runtime_signal_overrides = runtime_signal_overrides
+        app.engine = SimpleNamespace(signal_overrides=runtime_signal_overrides, state=ReplayState.RUNNING)
+        app._workspace_overrides = {}
+        app._workspace_override_lock = threading.Lock()
+        app._active_runtime_scenario = scenario
+        return app
+
+    def test_set_workspace_signal_override_syncs_active_runtime_replay(self) -> None:
+        scenario = ScenarioSpec(
+            scenario_id="scenario-runtime-override",
+            name="Runtime override",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock0",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+            signal_overrides=[
+                SignalOverride(
+                    logical_channel=0,
+                    message_id_or_pgn=0x123,
+                    signal_name="VehicleSpeed",
+                    value=10,
+                )
+            ],
+        )
+        app = self._make_runtime_override_app(scenario)
+        app.engine.signal_overrides.set_override(scenario.signal_overrides[0])
+
+        app.set_workspace_signal_override(
+            SignalOverride(
+                logical_channel=0,
+                message_id_or_pgn=0x123,
+                signal_name="VehicleSpeed",
+                value=88,
+            ),
+            sync_runtime=True,
+        )
+
+        overrides = app.engine.signal_overrides.list_overrides()
+        self.assertEqual(1, len(overrides))
+        self.assertEqual(88, overrides[0].value)
+        self.assertEqual(88, app.list_workspace_signal_overrides()[0].value)
+
+    def test_clear_workspace_signal_override_sync_restores_scenario_default(self) -> None:
+        scenario = ScenarioSpec(
+            scenario_id="scenario-runtime-clear",
+            name="Runtime clear",
+            bindings=[
+                DeviceChannelBinding(
+                    adapter_id="mock0",
+                    driver="mock",
+                    logical_channel=0,
+                    physical_channel=0,
+                    bus_type=BusType.CAN,
+                    device_type="MOCK",
+                )
+            ],
+            signal_overrides=[
+                SignalOverride(
+                    logical_channel=0,
+                    message_id_or_pgn=0x123,
+                    signal_name="VehicleSpeed",
+                    value=10,
+                )
+            ],
+        )
+        workspace_override = SignalOverride(
+            logical_channel=0,
+            message_id_or_pgn=0x123,
+            signal_name="VehicleSpeed",
+            value=88,
+        )
+        app = self._make_runtime_override_app(scenario)
+        app.replace_workspace_signal_overrides([workspace_override])
+        app.engine.signal_overrides.set_override(scenario.signal_overrides[0])
+        app.engine.signal_overrides.set_override(workspace_override)
+
+        app.clear_workspace_signal_override(0, 0x123, "VehicleSpeed", sync_runtime=True)
+
+        overrides = app.engine.signal_overrides.list_overrides()
+        self.assertEqual(1, len(overrides))
+        self.assertEqual(10, overrides[0].value)
+        self.assertEqual([], app.list_workspace_signal_overrides())
 
     def test_start_prepared_replay_clears_previous_runtime_databases_and_overrides(self) -> None:
         try:

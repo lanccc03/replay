@@ -5312,7 +5312,7 @@ def build_main_window(app_logic: ReplayApplication):
                     signal_name=signal_name,
                     value=value,
                 )
-                self.app_logic.set_workspace_signal_override(override)
+                self.app_logic.set_workspace_signal_override(override, sync_runtime=True)
             except Exception as exc:
                 QMessageBox.critical(self, "信号覆盖失败", str(exc))
                 return
@@ -5325,7 +5325,7 @@ def build_main_window(app_logic: ReplayApplication):
             except Exception as exc:
                 QMessageBox.critical(self, "载入失败", str(exc))
                 return
-            self.app_logic.replace_workspace_signal_overrides(scenario.signal_overrides)
+            self.app_logic.replace_workspace_signal_overrides(scenario.signal_overrides, sync_runtime=True)
             self._refresh_overrides()
 
         def _write_workspace_overrides_to_scenario(self) -> None:
@@ -5370,7 +5370,7 @@ def build_main_window(app_logic: ReplayApplication):
                 key = item.data(USER_ROLE)
                 if not key:
                     continue
-                self.app_logic.clear_workspace_signal_override(*key)
+                self.app_logic.clear_workspace_signal_override(*key, sync_runtime=True)
             self._refresh_overrides()
 
         def _delete_selected_frame_enables(self) -> None:
@@ -5393,7 +5393,7 @@ def build_main_window(app_logic: ReplayApplication):
             self._refresh_logs()
 
         def _clear_all_overrides(self) -> None:
-            self.app_logic.clear_workspace_signal_overrides()
+            self.app_logic.clear_workspace_signal_overrides(sync_runtime=True)
             self._refresh_overrides()
 
         def _clear_all_frame_enables(self) -> None:
