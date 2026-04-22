@@ -17,6 +17,7 @@
   - 诊断：`docs/diagnostics.md`
   - Windows / ZLG / 同星 硬件边界：`docs/windows-hardware.md`
   - 验证要求：`docs/testing.md`
+  - 中文文案 / 文档 / 乱码排查：`docs/text-encoding.md`
   - Trace 导入：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
   - DBC / 信号覆盖：`src/replay_platform/services/signal_catalog.py`
   - ZLG 设备：`src/replay_platform/adapters/zlg.py`
@@ -32,6 +33,9 @@
 - 如果用户让你分析回放偏差或发送性能问题，先把以下结论当成已排查前提：切换到 `sync` 发送不行；调整 2ms 切片内的帧间隔也不行。除非拿到新的代码证据或 Windows 真机证据，否则不要重复把这两个方向当主方案。
 - 场景结构必须继续兼容 `ScenarioSpec.from_dict()` / `to_dict()`。
 - 新增 UI 文案默认保持中文。
+- 仓库内源码、文档、配置文件默认使用 UTF-8 保存；除非文件本身已有明确约定，不要切换到 GBK / ANSI，也不要无意引入 UTF-8 BOM。
+- 在 PowerShell 中读取或写入中文文本时显式指定 UTF-8；读取优先 `Get-Content -Encoding utf8`，写入优先显式 UTF-8 的工具或参数，不要只凭裸 `Get-Content` / `Set-Content` 的显示结果判断是否乱码。
+- 看到乱码时，先区分“终端 / 编辑器显示链路问题”与“文件内容局部污染”；在未确认前不要整文件转码或整文件重写。
 - `zlgcan_python_251211/` 与 `TSMasterApi/` 只在确有必要时修改。
 - 不要提交或依赖 `__pycache__` 内容。
 
@@ -53,7 +57,7 @@
 
 - 详细命令和测试映射统一看 `docs/testing.md`。
 - 若任务采用 ExecPlan，交付前同步更新对应计划文档，确保计划中的进度、决策、验证结论与实际代码一致。
-- 纯文档改动：至少检查路径、模块名、命令与仓库一致。
+- 纯文档改动：至少检查路径、模块名、命令与仓库一致；若涉及中文文本，再做一次显式 UTF-8 读取自检。
 - 纯 UI 改动：至少做 `python -m compileall src tests`；若涉及表单解析或场景编辑逻辑，补或更新 `tests/test_ui_helpers.py`。
 - 运行时 / 解析 / 场景结构改动：运行全部 `unittest`，并补对应模块测试。
 - 最终说明里必须写清楚：
@@ -65,6 +69,8 @@
 
 - 是否破坏 `ScenarioSpec` 的 JSON 兼容性
 - 是否新增英文 UI 文案
+- 是否把文本文件误存成了非 UTF-8，或无意引入了 UTF-8 BOM
+- 是否把 PowerShell 显示乱码误判成源码损坏
 - 是否把 Windows 专属能力误写成跨平台可用
 - 是否修改了 ZLG / 同星 / DoIP 行为却没有补测试或说明限制
 - 是否明确写出“已验证 / 未验证”的边界
