@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "mock-canfd-demo",
+  "traces": [
+    {
+      "id": "trace1",
+      "path": "sample.asc"
+    }
+  ],
+  "devices": [
+    {
+      "id": "mock0",
+      "driver": "mock",
+      "application": "ReplayTool",
+      "sdk_root": "",
+      "device_type": "MOCK",
+      "device_index": 0,
+      "project_path": "",
+      "metadata": {
+        "channel_count": 2
+      }
+    }
+  ],
+  "channels": [
+    {
+      "logical_channel": 0,
+      "trace_id": "trace1",
+      "source_channel": 0,
+      "device_id": "mock0",
+      "physical_channel": 0,
+      "bus": "CANFD",
+      "nominal_baud": 500000,
+      "data_baud": 2000000,
+      "resistance_enabled": true,
+      "listen_only": false,
+      "tx_echo": false
+    }
+  ],
+  "replay": {
+    "loop": false
+  }
+}
