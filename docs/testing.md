@@ -1,6 +1,6 @@
 # 测试与验证
 
-本文集中说明验证命令、测试文件映射和不同类型改动的最低验证要求。`agents.md` 只保留执行清单，这里保留可直接引用的命令与覆盖范围。
+本文集中说明验证命令、测试文件映射和不同类型改动的最低验证要求。`AGENTS.md` 只保留执行清单，这里保留可直接引用的命令与覆盖范围。
 
 ## 1. 常用命令
 
@@ -37,9 +37,9 @@ $env:PYTHONPYCACHEPREFIX = (Join-Path $PWD ".pycache_tmp")
 ## 2. 测试文件映射
 
 - `tests/test_engine.py`
-  回放引擎时间轴、暂停恢复、链路动作、循环完成态
+  回放引擎时间轴、暂停恢复、链路动作、循环完成态，以及 `frame_dispatch`、`diagnostic_worker`、`health` 的运行时协作者行为
 - `tests/test_app_controller.py`
-  应用编排、场景加载、启动来源回退、日志策略
+  应用编排、场景加载、启动来源回退、日志策略，以及 `replay_preparation`、`runtime_overrides`、adapter factory 的兼容行为
 - `tests/test_library.py`
   trace 导入、缓存与场景持久化
 - `tests/test_trace_loader.py`
@@ -51,13 +51,13 @@ $env:PYTHONPYCACHEPREFIX = (Join-Path $PWD ".pycache_tmp")
 - `tests/test_dtc.py`
   DTC 解析
 - `tests/test_ui_helpers.py`
-  场景编辑表单解析与草稿归一化
+  场景编辑表单解析、`scenario_draft` 草稿归一化与 Qt-free 展示 helper
 - `tests/test_ui_dialog.py`
   Qt 场景编辑器对话框回归
 - `tests/test_zlg_adapter.py`
-  ZLG 适配器封装与 CAN FD 发送行为
+  ZLG 适配器封装、`can_codec` 共享编码路径与 CAN FD 发送行为
 - `tests/test_tongxing_adapter.py`
-  同星 TSMaster 适配器封装、项目回退、收发与连接状态行为
+  同星 TSMaster 适配器封装、`can_codec` 共享编码路径、项目回退、收发与连接状态行为
 
 ## 3. 最低验证要求
 

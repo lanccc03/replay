@@ -2,7 +2,7 @@
 
 面向 Windows 的多总线回放与诊断桌面工具，围绕 ZLG / 同星设备覆盖 CAN、CANFD、J1939 回放，并提供 DoIP 诊断、场景管理、信号在线改值和 DTC 诊断流程。
 
-更详细的专题说明已经拆分到 [`docs/`](docs/README.md)；如果你是工程代理，请先读 [`agents.md`](agents.md)。
+更详细的专题说明已经拆分到 [`docs/`](docs/)；如果你是工程代理，请先读 [`AGENTS.md`](AGENTS.md)。
 
 ## 1. 项目定位与范围
 
@@ -85,10 +85,10 @@ replay/
 ├── docs/                          项目专题文档
 ├── examples/                      示例场景
 ├── src/replay_platform/           主代码
-│   ├── adapters/                  设备适配层
+│   ├── adapters/                  设备适配层、适配器工厂与 CAN 编码 helper
 │   ├── diagnostics/               诊断与 DTC
-│   ├── runtime/                   回放运行时
-│   ├── services/                  文件库、场景库、信号服务
+│   ├── runtime/                   回放运行时、帧分发、诊断 worker 与健康快照
+│   ├── services/                  文件库、场景库、信号服务与回放准备协作者
 │   ├── ui/                        PySide6 界面
 │   ├── app_controller.py          应用编排入口
 │   ├── core.py                    核心类型定义
@@ -102,7 +102,6 @@ replay/
 
 详细专题说明见：
 
-- [`docs/README.md`](docs/README.md)：文档导航与阅读顺序
 - [`docs/architecture.md`](docs/architecture.md)：分层架构、核心模块职责、统一时间轴模型
 - [`docs/scenario-and-trace.md`](docs/scenario-and-trace.md)：场景 JSON、trace 导入、信号覆盖、运行数据目录
 - [`docs/diagnostics.md`](docs/diagnostics.md)：CAN UDS、DoIP、DTC、ZLG 原始 UDS 导出
@@ -112,7 +111,7 @@ replay/
 
 如果你是在本仓库中执行改动任务的工程代理，请额外阅读：
 
-- [`agents.md`](agents.md)
+- [`AGENTS.md`](AGENTS.md)
 
 ## 6. 关键入口
 

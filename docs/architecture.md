@@ -54,12 +54,26 @@
   数据契约中心；场景结构、时间轴事件、诊断对象的修改都应先从这里评估影响面。
 - `src/replay_platform/app_controller.py`
   应用编排入口；负责调度 UI、场景、信号覆盖、运行时与适配器。
+- `src/replay_platform/services/replay_preparation.py`
+  回放准备协作者；负责 trace 映射、source 过滤、prepared-trace cache key 与多 trace 有序合并。
+- `src/replay_platform/services/runtime_overrides.py`
+  运行时覆盖协作者；负责数据库绑定加载、信号覆盖校验和场景默认覆盖与工作区覆盖的运行时同步。
 - `src/replay_platform/runtime/engine.py`
   统一回放引擎；负责构建时间轴、维护运行状态、调度帧发送 / 诊断动作 / 链路动作，以及暂停恢复时的时间基准重绑定。
+- `src/replay_platform/runtime/frame_dispatch.py`
+  帧分发纯逻辑；负责报文启停过滤、信号覆盖后的帧准备和逻辑通道到物理通道映射。
+- `src/replay_platform/runtime/diagnostic_worker.py`
+  诊断队列 worker；负责诊断动作的异步队列、线程生命周期和停止时清队列。
+- `src/replay_platform/runtime/health.py`
+  适配器健康快照缓存；负责运行时状态刷新中的健康信息节流与安全快照。
 - `src/replay_platform/services/library.py`
   trace 文件导入、本地缓存、SQLite 元数据索引、场景保存加载。
 - `src/replay_platform/services/signal_catalog.py`
   DBC / J1939 DBC 绑定，发送前的 `decode -> patch -> encode`。
+- `src/replay_platform/adapters/factory.py`
+  适配器与诊断客户端构建；负责从场景绑定创建 ZLG、同星、Mock、CAN UDS 与 DoIP 客户端。
+- `src/replay_platform/adapters/can_codec.py`
+  CAN / CANFD / J1939 公共帧编码 helper；集中处理 ID、扩展帧标志、DLC、payload 裁剪等适配器共用逻辑。
 - `src/replay_platform/adapters/zlg.py`
   ZLG 设备加载、通道配置、收发、健康检查、底层 UDS DLL 导出入口。
 - `src/replay_platform/adapters/tongxing.py`
@@ -68,8 +82,10 @@
   UI 兼容入口；保留 `build_main_window()` 和历史 helper 导出。
 - `src/replay_platform/ui/main_window_view.py`、`src/replay_platform/ui/scenario_editor.py`
   主窗口与二级场景编辑器入口；具体构建、状态刷新、操作槽函数拆在同目录的 `*_ui.py`、`*_state.py`、`*_actions.py`、`scenario_editor_*` 模块中。UI 文案默认保持中文。
+- `src/replay_platform/ui/scenario_draft.py`
+  不依赖 PySide6 的场景草稿解析、归一化与校验逻辑；场景编辑器只负责控件读写、错误展示和焦点定位。
 - `src/replay_platform/ui/window_presenters.py`
-  不依赖 PySide6 的 UI 解析、归一化、校验和展示文本 helper。
+  不依赖 PySide6 的 UI 展示文本、摘要、选项和兼容导出 helper；场景草稿解析与校验已拆到 `scenario_draft.py`。
 - `src/replay_platform/ui/qss/`
   主窗口与场景编辑器的 QSS 静态样式资源。
 

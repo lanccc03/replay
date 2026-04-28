@@ -18,8 +18,12 @@
   - Windows / ZLG / 同星 硬件边界：`docs/windows-hardware.md`
   - 验证要求：`docs/testing.md`
   - 中文文案 / 文档 / 乱码排查：`docs/text-encoding.md`
+  - 场景草稿 / 表单校验：`src/replay_platform/ui/scenario_draft.py`、`src/replay_platform/ui/window_presenters.py`、`src/replay_platform/ui/scenario_editor_validation.py`
   - Trace 导入：`src/replay_platform/services/library.py`、`src/replay_platform/services/trace_loader.py`
+  - 回放准备 / 应用编排协作者：`src/replay_platform/services/replay_preparation.py`、`src/replay_platform/services/runtime_overrides.py`、`src/replay_platform/adapters/factory.py`
   - DBC / 信号覆盖：`src/replay_platform/services/signal_catalog.py`
+  - 运行时拆分：`src/replay_platform/runtime/frame_dispatch.py`、`src/replay_platform/runtime/diagnostic_worker.py`、`src/replay_platform/runtime/health.py`
+  - 适配器公共帧编码：`src/replay_platform/adapters/can_codec.py`
   - ZLG 设备：`src/replay_platform/adapters/zlg.py`
   - 同星设备：`src/replay_platform/adapters/tongxing.py`
   - 录制：`src/replay_platform/runtime/recorder.py`

@@ -3,13 +3,13 @@
 本目录只放长期专题说明；仓库入口与执行约束分工如下：
 
 - [`README.md`](../README.md)：项目定位、环境、启动方式、目录概览
-- [`agents.md`](../agents.md)：工程代理的阅读顺序、硬边界、验证与交付要求
+- [`AGENTS.md`](../AGENTS.md)：工程代理的阅读顺序、硬边界、验证与交付要求
 - `docs/`：按主题拆分的长期说明，不重复维护执行清单
 
 建议阅读顺序：
 
 1. 先读 [`README.md`](../README.md)
-2. 如果要改代码或文档，再读 [`agents.md`](../agents.md)
+2. 如果要改代码或文档，再读 [`AGENTS.md`](../AGENTS.md)
 3. 再看 [`architecture.md`](./architecture.md) 理解整体分层
 4. 按任务主题继续阅读对应专题文档
 
