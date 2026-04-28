@@ -65,7 +65,11 @@
 - `src/replay_platform/adapters/tongxing.py`
   同星 / TSMaster 设备加载、应用映射、通道配置、收发与健康检查。
 - `src/replay_platform/ui/main_window.py`
-  主窗口与二级场景编辑器所在位置；UI 文案默认保持中文。
+  UI 兼容入口；保留 `build_main_window()` 和历史 helper 导出。
+- `src/replay_platform/ui/main_window_view.py`、`src/replay_platform/ui/scenario_editor.py`
+  主窗口与二级场景编辑器入口；具体构建、状态刷新、操作槽函数拆在同目录的 `*_ui.py`、`*_state.py`、`*_actions.py`、`scenario_editor_*` 模块中。UI 文案默认保持中文。
+- `src/replay_platform/ui/window_presenters.py`
+  不依赖 PySide6 的 UI 解析、归一化、校验和展示文本 helper。
 
 ## 4. 扩展约束
 
