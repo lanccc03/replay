@@ -1,0 +1,124 @@
+QDialog#scenarioEditorDialog {
+    background: #f7f1ea;
+    color: #1f1b16;
+}
+QDialog#scenarioEditorDialog QFrame#editorToolbar {
+    background: #fffaf5;
+    border: 1px solid #e6d7c7;
+    border-radius: 16px;
+}
+QDialog#scenarioEditorDialog QLabel[role="headerTitle"] {
+    font-size: 18px;
+    font-weight: 700;
+}
+QDialog#scenarioEditorDialog QLabel[role="sectionHint"] {
+    color: #6b7280;
+}
+QDialog#scenarioEditorDialog QLabel[tone="good"] {
+    color: #15803d;
+}
+QDialog#scenarioEditorDialog QLabel[tone="warn"] {
+    color: #b45309;
+}
+QDialog#scenarioEditorDialog QLabel[tone="error"] {
+    color: #b42318;
+}
+QDialog#scenarioEditorDialog QLabel[tone="muted"] {
+    color: #6b7280;
+}
+QDialog#scenarioEditorDialog QLabel[errorLabel="true"] {
+    color: #b42318;
+    min-height: 16px;
+}
+QDialog#scenarioEditorDialog QGroupBox {
+    background: #fffaf5;
+    border: 1px solid #e6d7c7;
+    border-radius: 16px;
+    margin-top: 14px;
+    font-weight: 700;
+}
+QDialog#scenarioEditorDialog QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+}
+QDialog#scenarioEditorDialog QFrame#bindingEditorPanel {
+    background: #fff;
+    border: 1px solid #e6d7c7;
+    border-radius: 14px;
+}
+QDialog#scenarioEditorDialog QPushButton {
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 700;
+    border: 1px solid #d1d5db;
+    background: #f3f4f6;
+    color: #1f2937;
+}
+QDialog#scenarioEditorDialog QPushButton:hover {
+    background: #e5e7eb;
+}
+QDialog#scenarioEditorDialog QPushButton[variant="primary"] {
+    border-color: #2563eb;
+    background: #2563eb;
+    color: white;
+}
+QDialog#scenarioEditorDialog QPushButton[variant="primary"]:hover {
+    background: #1d4ed8;
+}
+QDialog#scenarioEditorDialog QPushButton[variant="danger"] {
+    border-color: #dc2626;
+    background: #dc2626;
+    color: white;
+}
+QDialog#scenarioEditorDialog QPushButton[variant="danger"]:hover {
+    background: #b91c1c;
+}
+QDialog#scenarioEditorDialog QLineEdit,
+QDialog#scenarioEditorDialog QPlainTextEdit,
+QDialog#scenarioEditorDialog QListWidget,
+QDialog#scenarioEditorDialog QComboBox {
+    background: #fff;
+    border: 1px solid #d6c8bb;
+    border-radius: 10px;
+    padding: 6px 8px;
+}
+QDialog#scenarioEditorDialog QLineEdit[readOnly="true"] {
+    background: #f3ede7;
+    color: #6b5f55;
+}
+QDialog#scenarioEditorDialog QLineEdit[errorState="true"],
+QDialog#scenarioEditorDialog QPlainTextEdit[errorState="true"],
+QDialog#scenarioEditorDialog QComboBox[errorState="true"] {
+    border-color: #b42318;
+    background: #fff5f5;
+}
+QDialog#scenarioEditorDialog QListWidget {
+    padding: 4px;
+}
+QDialog#scenarioEditorDialog QListWidget::item {
+    border-radius: 8px;
+    padding: 6px;
+}
+QDialog#scenarioEditorDialog QListWidget::item:selected {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+QDialog#scenarioEditorDialog QTabWidget::pane {
+    border: 1px solid #e6d7c7;
+    border-radius: 14px;
+    background: #fffaf5;
+}
+QDialog#scenarioEditorDialog QTabBar::tab {
+    background: #efe5da;
+    border: 1px solid #e6d7c7;
+    border-bottom: none;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    padding: 8px 14px;
+    margin-right: 4px;
+}
+QDialog#scenarioEditorDialog QTabBar::tab:selected {
+    background: #fffaf5;
+    color: #2563eb;
+}

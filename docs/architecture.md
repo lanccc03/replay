@@ -70,6 +70,8 @@
   主窗口与二级场景编辑器入口；具体构建、状态刷新、操作槽函数拆在同目录的 `*_ui.py`、`*_state.py`、`*_actions.py`、`scenario_editor_*` 模块中。UI 文案默认保持中文。
 - `src/replay_platform/ui/window_presenters.py`
   不依赖 PySide6 的 UI 解析、归一化、校验和展示文本 helper。
+- `src/replay_platform/ui/qss/`
+  主窗口与场景编辑器的 QSS 静态样式资源。
 
 ## 4. 扩展约束
 

@@ -138,6 +138,12 @@ Final validation:
 
     main_window.py final line count: 28
 
+QSS follow-up cleanup:
+
+    Moved the long main-window and scenario-editor stylesheets out of styles.py into src/replay_platform/ui/qss/*.qss.
+    styles.py still exports MAIN_WINDOW_STYLESHEET and SCENARIO_EDITOR_STYLESHEET, now loaded through a PySide-free qss_loader module.
+    Added package-data configuration for qss/*.qss and lightweight loader tests in tests/test_ui_styles.py.
+
 Untested boundaries:
 
     PySide6 is not installed in this environment, so tests/test_ui_dialog.py skipped 11 Qt dialog tests and no manual Qt clicking was performed.
@@ -154,3 +160,5 @@ The final `build_main_window` signature remains:
         return MainWindow(app_logic)
 
 Revision note: initial ExecPlan created before code changes to satisfy the repository requirement for significant UI refactors.
+
+Revision note: added the QSS asset split follow-up after moving static stylesheet text into packaged UTF-8 .qss files while keeping the Python style helper API stable.
