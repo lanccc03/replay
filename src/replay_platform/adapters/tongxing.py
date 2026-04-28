@@ -4,6 +4,14 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 from replay_platform.adapters.base import DeviceAdapter
+from replay_platform.adapters.can_codec import (
+    arbitration_id,
+    canfd_dlc_from_payload,
+    canfd_payload,
+    classic_payload,
+    is_extended_id,
+    timestamp_us,
+)
 from replay_platform.core import (
     AdapterCapabilities,
     AdapterHealth,
@@ -25,7 +33,7 @@ from ctypes import byref, c_char_p, c_int32
 from pathlib import Path
 from typing import Any, Dict, Union
 
-from replay_platform.core import BusType, DeviceChannelBinding, canfd_payload_length_to_dlc
+from replay_platform.core import BusType, DeviceChannelBinding
 from replay_platform.errors import ConfigurationError
 
 
@@ -640,27 +648,27 @@ class TongxingDeviceAdapter(DeviceAdapter):
 
     def _build_can_frame(self, event: FrameEvent):
         frame = self._runtime.ts_struct.TLIBCAN()
-        payload = bytes(event.payload[:8])
+        payload = classic_payload(event)
         properties = 0x01
-        if _is_extended_id(event):
+        if is_extended_id(event):
             properties |= 0x04
         if event.flags.get("remote"):
             properties |= 0x02
         frame.FIdxChn = int(event.channel)
         frame.FProperties = properties
         frame.FDLC = min(len(payload), 8)
-        frame.FIdentifier = int(_raw_can_id(event))
-        frame.FTimeUs = max(int(event.ts_ns // 1000), 0)
+        frame.FIdentifier = int(arbitration_id(event))
+        frame.FTimeUs = timestamp_us(event)
         for index, value in enumerate(payload):
             frame.FData[index] = value
         return frame
 
     def _build_canfd_frame(self, event: FrameEvent):
         frame = self._runtime.ts_struct.TLIBCANFD()
-        payload = bytes(event.payload[:64])
-        dlc = canfd_payload_length_to_dlc(len(payload))
+        payload = canfd_payload(event)
+        dlc = canfd_dlc_from_payload(payload)
         properties = 0x01
-        if _is_extended_id(event):
+        if is_extended_id(event):
             properties |= 0x04
         if event.flags.get("remote"):
             properties |= 0x02
@@ -673,8 +681,8 @@ class TongxingDeviceAdapter(DeviceAdapter):
         frame.FProperties = properties
         frame.FDLC = int(dlc)
         frame.FFDProperties = fd_properties
-        frame.FIdentifier = int(_raw_can_id(event))
-        frame.FTimeUs = max(int(event.ts_ns // 1000), 0)
+        frame.FIdentifier = int(arbitration_id(event))
+        frame.FTimeUs = timestamp_us(event)
         for index, value in enumerate(payload):
             frame.FData[index] = value
         return frame
@@ -872,11 +880,3 @@ def _resolve_enum_value(enum_type: Any, value: Any) -> Optional[int]:
         if member.name.lower() == text.lower():
             return int(member)
     return None
-
-
-def _is_extended_id(event: FrameEvent) -> bool:
-    return bool(event.flags.get("extended")) or event.bus_type == BusType.J1939 or int(event.message_id) > 0x7FF
-
-
-def _raw_can_id(event: FrameEvent) -> int:
-    return int(event.message_id) & 0x1FFFFFFF

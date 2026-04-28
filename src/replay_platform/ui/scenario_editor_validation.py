@@ -212,176 +212,19 @@ class ScenarioEditorValidationMixin:
         self._apply_validation_visuals()
 
     def _validate_current_draft(self) -> DraftValidationResult:
-        issues: list[ValidationIssue] = []
-        warnings: list[ValidationIssue] = []
-        normalized_bindings: list[tuple[int, dict]] = []
-        normalized_database_bindings: list[dict] = []
-        for index, item in enumerate(self._draft_bindings):
-            normalized_item, item_issues = _validate_binding_draft(item, index)
-            if item_issues:
-                issues.extend(item_issues)
-                continue
-            normalized_bindings.append((index, normalized_item or {}))
-
-        normalized_collections: dict[str, list[dict]] = {
-            "database_bindings": [],
-            "signal_overrides": [],
-            "diagnostic_targets": [],
-            "diagnostic_actions": [],
-            "link_actions": [],
-        }
-        collection_normalizers = {
-            "database_bindings": _normalize_database_binding_item,
-            "signal_overrides": _normalize_signal_override_item,
-            "diagnostic_targets": _normalize_diagnostic_target_item,
-            "diagnostic_actions": _normalize_diagnostic_action_item,
-            "link_actions": _normalize_link_action_item,
-        }
-        for key, items in self._collection_data.items():
-            for index, item in enumerate(items):
-                try:
-                    normalized_collections[key].append(collection_normalizers[key](item, path_prefix=f"{key}[{index}]"))
-                except FieldValidationError as exc:
-                    issues.append(ValidationIssue(key, exc.path, str(exc)))
-
-        for index, item in enumerate(self._database_binding_items()):
-            try:
-                normalized_database_bindings.append(
-                    _normalize_database_binding_item(item, path_prefix=f"database_bindings[{index}]")
-                )
-            except FieldValidationError as exc:
-                issues.append(ValidationIssue("bindings", exc.path, str(exc)))
-
-        try:
-            metadata = _parse_json_object_text(self.metadata_editor.toPlainText(), "场景元数据")
-        except ValueError as exc:
-            issues.append(ValidationIssue("metadata", "metadata", str(exc)))
-            metadata = {}
-
-        trace_ids = self._checked_trace_ids()
-        existing_trace_ids = set(self._binding_trace_lookup())
-        missing_trace_ids = [trace_id for trace_id in trace_ids if trace_id not in existing_trace_ids]
-        if missing_trace_ids:
-            warnings.append(
-                ValidationIssue(
-                    "traces",
-                    "trace_file_ids",
-                    f"当前场景仍引用 {len(missing_trace_ids)} 个缺失文件。",
-                )
-            )
-
-        file_mapped_trace_ids: set[str] = set()
-        used_physical_channels: dict[tuple[str, int], int] = {}
-        has_file_mapping = False
-        for binding_index, binding in normalized_bindings:
-            if not _binding_uses_trace_source(binding):
-                continue
-            has_file_mapping = True
-            trace_file_id = _display_text(binding.get("trace_file_id", "")).strip()
-            if trace_file_id in file_mapped_trace_ids:
-                issues.append(
-                    ValidationIssue(
-                        "bindings",
-                        f"bindings[{binding_index}].trace_file_id",
-                        "同一个场景文件只能保留一条文件映射。",
-                    )
-                )
-            else:
-                file_mapped_trace_ids.add(trace_file_id)
-            if trace_file_id and trace_file_id not in trace_ids:
-                issues.append(
-                    ValidationIssue(
-                        "bindings",
-                        f"bindings[{binding_index}].trace_file_id",
-                        "文件映射必须引用当前已勾选的场景文件。",
-                    )
-                )
-            if trace_file_id in existing_trace_ids:
-                summaries = self._binding_trace_source_summaries(trace_file_id)
-                source_channel = binding.get("source_channel")
-                source_bus_type = _display_text(binding.get("source_bus_type", "")).strip().upper()
-                matched_summary = any(
-                    summary.get("source_channel") == source_channel
-                    and _display_text(summary.get("bus_type", "")).strip().upper() == source_bus_type
-                    for summary in summaries
-                )
-                if summaries and not matched_summary:
-                    issues.append(
-                        ValidationIssue(
-                            "bindings",
-                            f"bindings[{binding_index}].source_selector",
-                            "所选源项不属于当前文件，请重新选择。",
-                        )
-                    )
-            channel_key = (str(binding.get("adapter_id", "")), int(binding.get("physical_channel", 0)))
-            existing_binding_index = used_physical_channels.get(channel_key)
-            if existing_binding_index is not None:
-                issues.append(
-                    ValidationIssue(
-                        "bindings",
-                        f"bindings[{binding_index}].physical_channel",
-                        "同一个物理通道同一时刻只能映射一个文件。",
-                    )
-                )
-            else:
-                used_physical_channels[channel_key] = binding_index
-
-        for binding_index, binding in normalized_bindings:
-            warning = _binding_device_type_warning(binding, binding_index)
-            if warning is not None:
-                warnings.append(warning)
-
-        for logical_channel, duplicate_count in sorted(self._database_binding_duplicate_counts.items()):
-            warnings.append(
-                ValidationIssue(
-                    "bindings",
-                    f"database_bindings[{logical_channel}]",
-                    f"LC{logical_channel} 存在 {duplicate_count} 条DBC绑定，编辑器已按最后一条展示，保存时会去重。",
-                )
-            )
-
-        orphan_database_bindings = _database_binding_orphan_items(
-            self._database_binding_drafts,
-            [binding for _, binding in normalized_bindings],
+        return validate_scenario_draft(
+            scenario_id=self.scenario_id_edit.text(),
+            name=self.scenario_name_edit.text(),
+            metadata_text=self.metadata_editor.toPlainText(),
+            trace_ids=self._checked_trace_ids(),
+            existing_trace_ids=set(self._binding_trace_lookup()),
+            draft_bindings=self._draft_bindings,
+            database_binding_items=self._database_binding_items(),
+            database_binding_drafts=self._database_binding_drafts,
+            database_binding_duplicate_counts=self._database_binding_duplicate_counts,
+            collection_data=self._collection_data,
+            trace_source_summaries=self._binding_trace_source_summaries,
         )
-        if orphan_database_bindings:
-            warnings.append(
-                ValidationIssue(
-                    "bindings",
-                    "database_bindings",
-                    f"当前存在 {len(orphan_database_bindings)} 条孤立DBC绑定，默认保留，可在资源映射区单独移除。",
-                )
-            )
-
-        if has_file_mapping:
-            missing_mapped_trace_ids = sorted(set(trace_ids) - file_mapped_trace_ids)
-            if missing_mapped_trace_ids:
-                issues.append(
-                    ValidationIssue("traces", "trace_file_ids", "已勾选的场景文件必须全部完成文件映射。")
-                )
-
-        if issues:
-            return DraftValidationResult(None, issues, warnings)
-
-        bindings = [binding for _, binding in normalized_bindings]
-        payload = {
-            "scenario_id": self.scenario_id_edit.text().strip() or uuid.uuid4().hex,
-            "name": self.scenario_name_edit.text().strip() or "新场景",
-            "trace_file_ids": trace_ids,
-            "bindings": bindings,
-            "database_bindings": normalized_database_bindings,
-            "signal_overrides": normalized_collections["signal_overrides"],
-            "diagnostic_targets": normalized_collections["diagnostic_targets"],
-            "diagnostic_actions": normalized_collections["diagnostic_actions"],
-            "link_actions": normalized_collections["link_actions"],
-            "metadata": metadata,
-        }
-        try:
-            normalized_payload = _normalize_scenario_payload(payload)
-        except Exception as exc:
-            issues.append(ValidationIssue("basic", "scenario", str(exc)))
-            return DraftValidationResult(None, issues, warnings)
-        return DraftValidationResult(normalized_payload, issues, warnings)
 
     def _run_live_validation(
         self,

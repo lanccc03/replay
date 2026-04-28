@@ -1351,6 +1351,56 @@ def _normalize_link_action_item(item: dict, *, path_prefix: str = "link_actions[
         raise FieldValidationError(path_prefix, str(exc)) from exc
 
 
+from replay_platform.ui.scenario_draft import (  # noqa: E402
+    BUS_OPTIONS as BUS_OPTIONS,
+    DRIVER_DEVICE_TYPE_OPTIONS as DRIVER_DEVICE_TYPE_OPTIONS,
+    DRIVER_OPTIONS as DRIVER_OPTIONS,
+    LEGACY_ZLG_DEVICE_TYPES as LEGACY_ZLG_DEVICE_TYPES,
+    LINK_ACTION_OPTIONS as LINK_ACTION_OPTIONS,
+    TRANSPORT_OPTIONS as TRANSPORT_OPTIONS,
+    ZLG_DEVICE_TYPE_OPTIONS as ZLG_DEVICE_TYPE_OPTIONS,
+    DraftValidationResult as DraftValidationResult,
+    FieldValidationError as FieldValidationError,
+    ValidationIssue as ValidationIssue,
+    _binding_device_type_options as _binding_device_type_options,
+    _binding_device_type_placeholder as _binding_device_type_placeholder,
+    _binding_device_type_warning as _binding_device_type_warning,
+    _binding_draft_from_item as _binding_draft_from_item,
+    _binding_uses_trace_source as _binding_uses_trace_source,
+    _binding_warning_subject as _binding_warning_subject,
+    _clone_jsonable as _clone_jsonable,
+    _database_binding_file_name as _database_binding_file_name,
+    _database_binding_items_from_map as _database_binding_items_from_map,
+    _database_binding_map_from_items as _database_binding_map_from_items,
+    _database_binding_orphan_items as _database_binding_orphan_items,
+    _default_sdk_root_for_driver as _default_sdk_root_for_driver,
+    _display_text as _display_text,
+    _format_field_value as _format_field_value,
+    _format_json_text as _format_json_text,
+    _new_binding_draft as _new_binding_draft,
+    _normalize_binding_item as _normalize_binding_item,
+    _normalize_database_binding_item as _normalize_database_binding_item,
+    _normalize_diagnostic_action_item as _normalize_diagnostic_action_item,
+    _normalize_diagnostic_target_item as _normalize_diagnostic_target_item,
+    _normalize_driver_name as _normalize_driver_name,
+    _normalize_link_action_item as _normalize_link_action_item,
+    _normalize_scenario_payload as _normalize_scenario_payload,
+    _normalize_signal_override_item as _normalize_signal_override_item,
+    _parse_bool_text as _parse_bool_text,
+    _parse_choice_text as _parse_choice_text,
+    _parse_device_type_text as _parse_device_type_text,
+    _parse_hex_bytes_text as _parse_hex_bytes_text,
+    _parse_int_text as _parse_int_text,
+    _parse_json_object_text as _parse_json_object_text,
+    _parse_optional_int_text as _parse_optional_int_text,
+    _parse_scalar_text as _parse_scalar_text,
+    _require_text as _require_text,
+    _scenario_payload_is_dirty as _scenario_payload_is_dirty,
+    _validate_binding_draft as _validate_binding_draft,
+    validate_scenario_draft as validate_scenario_draft,
+)
+
+
 class MainWindowMixin:
     """Small helper mixin so the UI module stays compact."""
 
@@ -1473,5 +1523,6 @@ __all__ = (
     '_normalize_diagnostic_target_item',
     '_normalize_diagnostic_action_item',
     '_normalize_link_action_item',
+    'validate_scenario_draft',
     'MainWindowMixin',
 )

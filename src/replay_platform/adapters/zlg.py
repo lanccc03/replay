@@ -8,6 +8,12 @@ import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from replay_platform.adapters.base import DeviceAdapter
+from replay_platform.adapters.can_codec import (
+    canfd_dlc_from_length,
+    canfd_payload,
+    classic_payload,
+    zlg_transmit_can_id,
+)
 from replay_platform.core import (
     AdapterCapabilities,
     AdapterHealth,
@@ -17,7 +23,6 @@ from replay_platform.core import (
     DeviceChannelBinding,
     DeviceDescriptor,
     FrameEvent,
-    canfd_payload_length_to_dlc,
 )
 from replay_platform.errors import AdapterOperationError, ConfigurationError
 
@@ -278,8 +283,8 @@ class ZlgDeviceAdapter(DeviceAdapter):
         memset(addressof(messages), 0, sizeof(messages))
         for index, event in enumerate(events):
             messages[index].transmit_type = 0
-            messages[index].frame.can_id = self._raw_can_id(event)
-            payload = event.payload[:8]
+            messages[index].frame.can_id = zlg_transmit_can_id(event)
+            payload = classic_payload(event)
             messages[index].frame.can_dlc = min(event.dlc, len(payload), 8)
             if event.flags.get("tx_echo"):
                 messages[index].frame._pad |= 0x20
@@ -300,8 +305,8 @@ class ZlgDeviceAdapter(DeviceAdapter):
         memset(addressof(messages), 0, sizeof(messages))
         for index, event in enumerate(events):
             messages[index].transmit_type = 0
-            messages[index].frame.can_id = self._raw_can_id(event)
-            payload = event.payload[:64]
+            messages[index].frame.can_id = zlg_transmit_can_id(event)
+            payload = canfd_payload(event)
             # ZLG 的 CANFD len 字段使用真实字节数；内部 FrameEvent.dlc 仍保留 DLC 码值。
             messages[index].frame.len = len(payload)
             if event.flags.get("tx_echo"):
@@ -392,19 +397,12 @@ class ZlgDeviceAdapter(DeviceAdapter):
             channel=physical_channel,
             message_id=int(frame.can_id),
             payload=payload,
-            dlc=canfd_payload_length_to_dlc(payload_length),
+            dlc=canfd_dlc_from_length(payload_length),
             flags={
                 "direction": direction,
                 "brs": bool(frame.flags & 0x01),
             },
         )
-
-    @staticmethod
-    def _raw_can_id(event: FrameEvent) -> int:
-        message_id = event.message_id
-        if event.bus_type == BusType.J1939 and not (message_id & (1 << 31)):
-            message_id |= 1 << 31
-        return message_id
 
 
 def _group_by_channel(batch: Sequence[FrameEvent]) -> Dict[int, List[FrameEvent]]:

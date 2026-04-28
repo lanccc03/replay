@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-import heapq
 import threading
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from replay_platform.adapters.base import DiagnosticClient, DeviceAdapter
+from replay_platform.adapters.factory import build_adapters as create_adapters
+from replay_platform.adapters.factory import build_diagnostics as create_diagnostics
 from replay_platform.adapters.mock import MockDeviceAdapter
 from replay_platform.adapters.tongxing import TongxingDeviceAdapter
 from replay_platform.adapters.zlg import ZlgDeviceAdapter
 from replay_platform.core import (
     AdapterCapabilities,
     BusType,
-    ChannelDescriptor,
     DatabaseBinding,
     DeviceChannelBinding,
-    DiagnosticTransport,
     FrameEvent,
     ReplayFrameLogMode,
     ReplayLaunchSource,
@@ -30,12 +28,16 @@ from replay_platform.core import (
     SignalOverride,
     TraceFileRecord,
 )
-from replay_platform.services.frame_enable import FrameEnableService
-from replay_platform.diagnostics.can_uds import CanUdsClient, IsoTpConfig
-from replay_platform.diagnostics.doip import DoipDiagnosticClient, DoipLinkAdapter
 from replay_platform.paths import AppPaths
 from replay_platform.runtime.engine import ReplayEngine
+from replay_platform.services.frame_enable import FrameEnableService
 from replay_platform.services.library import DeleteTraceResult, FileLibraryService
+from replay_platform.services.replay_preparation import (
+    PREPARED_TRACE_CACHE_LIMIT,
+    PreparedTraceCacheKey,
+    ReplayFramePreparer,
+)
+from replay_platform.services.runtime_overrides import RuntimeOverrideCoordinator
 from replay_platform.services.signal_catalog import SignalOverrideService
 from replay_platform.services.trace_loader import TraceLoader
 
@@ -52,7 +54,6 @@ LOG_LEVEL_PRESET_OPTIONS = (
     LOG_LEVEL_PRESET_DEBUG_SAMPLED,
     LOG_LEVEL_PRESET_DEBUG_ALL,
 )
-PREPARED_TRACE_CACHE_LIMIT = 6
 LOG_LEVEL_PRESET_CONFIGS = {
     LOG_LEVEL_PRESET_WARNING: (ReplayLogLevel.WARNING, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
     LOG_LEVEL_PRESET_INFO: (ReplayLogLevel.INFO, ReplayFrameLogMode.OFF, DEBUG_LOG_FRAME_SAMPLE_RATE),
@@ -73,22 +74,19 @@ class ReplayPreparation:
     loop_enabled: bool = False
 
 
-@dataclass(frozen=True)
-class PreparedTraceCacheKey:
-    trace_id: str
-    source_label: str
-    source_filters: tuple[tuple[int, str], ...]
-    mapped_bindings: tuple[tuple[int, int, str], ...]
-
-
 class ReplayApplication:
     def __init__(self, workspace: Path, log_config: ReplayLogConfig | None = None) -> None:
         self.paths = AppPaths(root=workspace)
         self.trace_loader = TraceLoader()
         self.library = FileLibraryService(self.paths, self.trace_loader)
+        self.replay_preparer = ReplayFramePreparer(self.library)
         self.signal_overrides = SignalOverrideService()
         self._runtime_signal_overrides = SignalOverrideService()
         self.frame_enables = FrameEnableService()
+        self.runtime_overrides = RuntimeOverrideCoordinator(
+            workspace_overrides=self.list_workspace_signal_overrides,
+            log_warning=self.log_warning,
+        )
         self.log_config = log_config or ReplayLogConfig()
         self.engine = ReplayEngine(
             signal_overrides=self._runtime_signal_overrides,
@@ -100,8 +98,6 @@ class ReplayApplication:
         self._log_base_index = 0
         self._log_lock = threading.Lock()
         self._last_runtime_state = ReplayState.STOPPED
-        self._prepared_trace_cache: OrderedDict[PreparedTraceCacheKey, tuple[FrameEvent, ...]] = OrderedDict()
-        self._prepared_trace_cache_lock = threading.Lock()
         self._workspace_overrides: Dict[tuple[int, int, str], SignalOverride] = {}
         self._workspace_override_lock = threading.Lock()
         self._active_runtime_scenario: ScenarioSpec | None = None
@@ -272,7 +268,7 @@ class ReplayApplication:
 
     def delete_trace(self, trace_id: str) -> DeleteTraceResult:
         result = self.library.delete_trace(trace_id)
-        self._invalidate_prepared_trace_cache(trace_id)
+        self.replay_preparer.invalidate_prepared_trace_cache(trace_id)
         return result
 
     def delete_scenario(self, scenario_id: str) -> None:
@@ -353,12 +349,19 @@ class ReplayApplication:
     def resume_replay(self) -> None:
         self.engine.resume()
 
+    def _runtime_override_coordinator(self) -> RuntimeOverrideCoordinator:
+        coordinator = getattr(self, "runtime_overrides", None)
+        if coordinator is None:
+            log_warning = self.log_warning if hasattr(self, "log_config") and hasattr(self, "_log_lock") else (lambda message: None)
+            coordinator = RuntimeOverrideCoordinator(
+                workspace_overrides=self.list_workspace_signal_overrides,
+                log_warning=log_warning,
+            )
+            self.runtime_overrides = coordinator
+        return coordinator
+
     def _apply_runtime_signal_overrides(self, scenario: ScenarioSpec) -> None:
-        self._runtime_signal_overrides.clear_overrides()
-        for override in scenario.signal_overrides:
-            self._runtime_signal_overrides.set_override(override)
-        for override in self.list_workspace_signal_overrides():
-            self._runtime_signal_overrides.set_override(override)
+        self._runtime_override_coordinator().apply_runtime_signal_overrides(self._runtime_signal_overrides, scenario)
 
     def _sync_runtime_signal_overrides(self) -> None:
         scenario = self._active_runtime_scenario
@@ -398,29 +401,7 @@ class ReplayApplication:
         service: SignalOverrideService,
         bindings: Sequence[DatabaseBinding],
     ) -> dict[int, dict[str, Any]]:
-        service.clear_codecs()
-        statuses: dict[int, dict[str, Any]] = {}
-        for binding in bindings:
-            logical_channel = int(binding.logical_channel)
-            normalized_format = str(binding.format or "dbc")
-            service.clear_codec(logical_channel)
-            status = {
-                "logical_channel": logical_channel,
-                "path": binding.path,
-                "format": normalized_format,
-                "loaded": False,
-                "error": "",
-                "message_count": 0,
-            }
-            try:
-                service.load_database(logical_channel, binding.path, format=normalized_format)
-            except Exception as exc:
-                status["error"] = str(exc).strip() or exc.__class__.__name__
-            else:
-                status["loaded"] = True
-                status["message_count"] = len(service.list_messages(logical_channel))
-            statuses[logical_channel] = status
-        return statuses
+        return self._runtime_override_coordinator().load_database_bindings(service, bindings)
 
     def _validate_signal_overrides(
         self,
@@ -428,249 +409,72 @@ class ReplayApplication:
         statuses: dict[int, dict[str, Any]],
         service: SignalOverrideService,
     ) -> None:
-        errors: list[str] = []
-        for source_label, override in overrides:
-            logical_channel = int(override.logical_channel)
-            status = statuses.get(logical_channel)
-            if status is None:
-                errors.append(
-                    f"{source_label}：LC{logical_channel} 未配置数据库，无法校验报文 0x{override.message_id_or_pgn:X} / {override.signal_name}。"
-                )
-                continue
-            if not status.get("loaded"):
-                errors.append(
-                    (
-                        f"{source_label}：LC{logical_channel} 的数据库 {status.get('path', '')} 加载失败，"
-                        f"无法校验报文 0x{override.message_id_or_pgn:X} / {override.signal_name}。"
-                        f" 原因：{status.get('error', '未知错误')}"
-                    )
-                )
-                continue
-            if override.message_id_or_pgn not in service.list_message_ids(logical_channel):
-                errors.append(
-                    f"{source_label}：LC{logical_channel} 的数据库未找到报文 0x{override.message_id_or_pgn:X}。"
-                )
-                continue
-            signal_names = service.list_signal_names(logical_channel, override.message_id_or_pgn)
-            if override.signal_name not in signal_names:
-                errors.append(
-                    (
-                        f"{source_label}：LC{logical_channel} 报文 0x{override.message_id_or_pgn:X} "
-                        f"未找到信号 {override.signal_name}。"
-                    )
-                )
-        if errors:
-            raise ValueError("信号覆盖校验失败：\n" + "\n".join(errors))
+        self._runtime_override_coordinator().validate_signal_overrides(overrides, statuses, service)
 
     def _log_database_binding_statuses(self, statuses: dict[int, dict[str, Any]]) -> None:
-        for logical_channel, status in sorted(statuses.items()):
-            if status.get("loaded"):
-                continue
-            self.log_warning(
-                (
-                    f"数据库绑定加载失败：LC{logical_channel} 路径={status.get('path', '')} "
-                    f"格式={status.get('format', '')} 原因={status.get('error', '未知错误')}"
-                )
-            )
+        self._runtime_override_coordinator().log_database_binding_statuses(statuses)
 
     def _load_replay_frames(self, scenario: ScenarioSpec) -> List[FrameEvent]:
-        trace_sequences: List[Sequence[FrameEvent]] = []
-        trace_bound_bindings: Dict[str, List[DeviceChannelBinding]] = {}
-        for binding in scenario.bindings:
-            if not binding.trace_file_id:
-                continue
-            if binding.source_channel is None or binding.source_bus_type is None:
-                raise ValueError(f"逻辑通道 {binding.logical_channel} 的文件映射不完整。")
-            trace_bound_bindings.setdefault(binding.trace_file_id, []).append(binding)
-        missing_trace_ids = sorted(set(trace_bound_bindings) - set(scenario.trace_file_ids))
-        if missing_trace_ids:
-            raise ValueError(f"存在未勾选但仍被映射的文件：{', '.join(missing_trace_ids)}")
-
-        for trace_id in scenario.trace_file_ids:
-            record = self.library.get_trace_file(trace_id)
-            if record is None:
-                raise FileNotFoundError(trace_id)
-            trace_sequences.append(
-                self._prepared_trace_sequence(
-                    record,
-                    trace_bound_bindings.get(trace_id, []),
-                )
-            )
-        return self._merge_sorted_frame_groups(trace_sequences)
+        return self.replay_preparer.load_replay_frames(scenario)
 
     def _prepared_trace_sequence(
         self,
         record: TraceFileRecord,
         mapped_bindings: Sequence[DeviceChannelBinding],
     ) -> Sequence[FrameEvent]:
-        cache_key = self._prepared_trace_cache_key(record, mapped_bindings)
-        cached = self._get_prepared_trace_cache(cache_key)
-        if cached is not None:
-            return cached
-        source_filters = self._source_filters_for_bindings(mapped_bindings)
-        trace_events = self.library.load_trace_events(record.trace_id, source_filters=source_filters)
-        source_label = record.original_path or record.name
-        if source_label:
-            trace_events = [event.clone(source_file=source_label) for event in trace_events]
-        if mapped_bindings:
-            events_by_source: Dict[tuple[int, BusType], List[FrameEvent]] = {}
-            for event in trace_events:
-                events_by_source.setdefault((event.channel, event.bus_type), []).append(event)
-            mapped_sequences = [
-                self._map_trace_events_for_binding(
-                    events_by_source.get((int(binding.source_channel), binding.source_bus_type), []),
-                    binding,
-                )
-                for binding in mapped_bindings
-            ]
-            prepared_sequence = tuple(self._merge_sorted_frame_groups(mapped_sequences))
-        else:
-            prepared_sequence = tuple(trace_events)
-        self._store_prepared_trace_cache(cache_key, prepared_sequence)
-        return prepared_sequence
+        return self.replay_preparer.prepared_trace_sequence(record, mapped_bindings)
 
     @staticmethod
     def _source_filters_for_bindings(
         mapped_bindings: Sequence[DeviceChannelBinding],
     ) -> set[tuple[int, BusType]] | None:
-        if not mapped_bindings:
-            return None
-        return {
-            (int(binding.source_channel), binding.source_bus_type)
-            for binding in mapped_bindings
-            if binding.source_channel is not None and binding.source_bus_type is not None
-        } or None
+        return ReplayFramePreparer.source_filters_for_bindings(mapped_bindings)
 
     @staticmethod
     def _prepared_trace_cache_key(
         record: TraceFileRecord,
         mapped_bindings: Sequence[DeviceChannelBinding],
     ) -> PreparedTraceCacheKey:
-        source_label = record.original_path or record.name
-        source_filters = tuple(
-            sorted(
-                (int(binding.source_channel), binding.source_bus_type.value)
-                for binding in mapped_bindings
-                if binding.source_channel is not None and binding.source_bus_type is not None
-            )
-        )
-        mapping_signature = tuple(
-            (
-                binding.logical_channel,
-                int(binding.source_channel),
-                binding.source_bus_type.value,
-            )
-            for binding in mapped_bindings
-            if binding.source_channel is not None and binding.source_bus_type is not None
-        )
-        return PreparedTraceCacheKey(
-            trace_id=record.trace_id,
-            source_label=source_label,
-            source_filters=source_filters,
-            mapped_bindings=mapping_signature,
-        )
+        return ReplayFramePreparer.prepared_trace_cache_key(record, mapped_bindings)
 
     def _get_prepared_trace_cache(
         self,
         cache_key: PreparedTraceCacheKey,
     ) -> tuple[FrameEvent, ...] | None:
-        with self._prepared_trace_cache_lock:
-            cached = self._prepared_trace_cache.get(cache_key)
-            if cached is None:
-                return None
-            self._prepared_trace_cache.move_to_end(cache_key)
-            return cached
+        return self.replay_preparer.get_prepared_trace_cache(cache_key)
 
     def _store_prepared_trace_cache(
         self,
         cache_key: PreparedTraceCacheKey,
         frames: tuple[FrameEvent, ...],
     ) -> None:
-        with self._prepared_trace_cache_lock:
-            self._prepared_trace_cache[cache_key] = frames
-            self._prepared_trace_cache.move_to_end(cache_key)
-            while len(self._prepared_trace_cache) > PREPARED_TRACE_CACHE_LIMIT:
-                self._prepared_trace_cache.popitem(last=False)
+        self.replay_preparer.store_prepared_trace_cache(cache_key, frames)
 
     def _invalidate_prepared_trace_cache(self, trace_id: str) -> None:
-        with self._prepared_trace_cache_lock:
-            stale_keys = [key for key in self._prepared_trace_cache if key.trace_id == trace_id]
-            for cache_key in stale_keys:
-                self._prepared_trace_cache.pop(cache_key, None)
+        self.replay_preparer.invalidate_prepared_trace_cache(trace_id)
 
     @staticmethod
     def _merge_sorted_frame_groups(frame_groups: Sequence[Sequence[FrameEvent]]) -> List[FrameEvent]:
-        non_empty_groups = [group for group in frame_groups if group]
-        if not non_empty_groups:
-            return []
-        if len(non_empty_groups) == 1:
-            return list(non_empty_groups[0])
-        return list(heapq.merge(*non_empty_groups, key=lambda item: item.ts_ns))
+        return ReplayFramePreparer.merge_sorted_frame_groups(frame_groups)
 
     @staticmethod
     def _map_trace_events_for_binding(
         trace_events: List[FrameEvent],
         binding: DeviceChannelBinding,
     ) -> List[FrameEvent]:
-        assert binding.source_channel is not None
-        assert binding.source_bus_type is not None
-        mapped_events: List[FrameEvent] = []
-        for event in trace_events:
-            if event.channel != binding.source_channel or event.bus_type != binding.source_bus_type:
-                continue
-            mapped_events.append(event.clone(channel=binding.logical_channel))
-        return mapped_events
+        return ReplayFramePreparer.map_trace_events_for_binding(trace_events, binding)
 
     def _build_adapters(self, scenario: ScenarioSpec) -> Dict[str, DeviceAdapter]:
-        adapters: Dict[str, DeviceAdapter] = {}
-        bindings_by_adapter: Dict[str, List[DeviceChannelBinding]] = {}
-        for binding in scenario.bindings:
-            bindings_by_adapter.setdefault(binding.adapter_id, []).append(binding)
-        for adapter_id, binding_group in bindings_by_adapter.items():
-            binding = binding_group[0]
-            driver = binding.driver.lower()
-            if driver == "zlg":
-                adapters[adapter_id] = ZlgDeviceAdapter(adapter_id, binding)
-            elif driver == "tongxing":
-                seed_binding = max(binding_group, key=lambda item: int(item.physical_channel))
-                adapters[adapter_id] = TongxingDeviceAdapter(adapter_id, seed_binding)
-            elif driver == "mock":
-                adapters[adapter_id] = MockDeviceAdapter(adapter_id)
-            else:
-                raise ValueError(f"不支持的驱动类型：{binding.driver}")
-        return adapters
+        return create_adapters(
+            scenario,
+            zlg_adapter_cls=ZlgDeviceAdapter,
+            tongxing_adapter_cls=TongxingDeviceAdapter,
+            mock_adapter_cls=MockDeviceAdapter,
+        )
 
     def _build_diagnostics(
         self,
         scenario: ScenarioSpec,
         adapters: Dict[str, DeviceAdapter],
     ) -> Dict[str, DiagnosticClient]:
-        diagnostics: Dict[str, DiagnosticClient] = {}
-        for target in scenario.diagnostic_targets:
-            if target.transport == DiagnosticTransport.DOIP:
-                diagnostics[target.name] = DoipDiagnosticClient(
-                    DoipLinkAdapter(
-                        host=target.host,
-                        port=target.port,
-                        source_address=target.source_address,
-                        target_address=target.target_address,
-                        activation_type=target.activation_type,
-                        timeout_ms=target.timeout_ms,
-                    )
-                )
-                continue
-            binding = scenario.find_binding(target.logical_channel)
-            if binding is None:
-                raise ValueError(f"诊断逻辑通道 {target.logical_channel} 未绑定设备。")
-            adapter = adapters[binding.adapter_id]
-            diagnostics[target.name] = CanUdsClient(
-                adapter,
-                IsoTpConfig(
-                    channel=binding.physical_channel,
-                    tx_id=target.tx_id,
-                    rx_id=target.rx_id,
-                    bus_type=binding.bus_type,
-                    timeout_ms=target.timeout_ms,
-                ),
-            )
-        return diagnostics
+        return create_diagnostics(scenario, adapters)
